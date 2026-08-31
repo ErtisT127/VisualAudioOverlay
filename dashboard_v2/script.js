@@ -15,6 +15,11 @@
  *   set_program(str)            - per-app capture target
  *   programsChanged(jsonStr)    - list of running audio programs
  *
+ *   set_selected_preset(str)      - persist the dropdown choice to settings.json
+ *   selectedPresetChanged(str)    - that choice, restored on load (name only)
+ *   audioSettingsChanged(jsonStr) - the live sensitivity/gain/freq/max-amp, so the
+ *                                   sliders follow a preset and come back on load
+ *
  * Mono output (single-sided listeners) - guarded so the UI works without them:
  *   set_mono_enabled(bool)      - turn the in-app mono down-mix on/off
  *   set_mono_output(str)        - which real device the mono mix plays to
@@ -55,7 +60,8 @@ function initBridge() {
             if (bridge.monoStateChanged) bridge.monoStateChanged.connect(onMonoStateChanged);
             if (bridge.updateAvailable) bridge.updateAvailable.connect(onUpdateAvailable);
             if (bridge.appearanceChanged) bridge.appearanceChanged.connect(onAppearanceChanged);
-            if (bridge.presetApplied) bridge.presetApplied.connect(onPresetApplied);
+            if (bridge.audioSettingsChanged) bridge.audioSettingsChanged.connect(onAudioSettingsChanged);
+            if (bridge.selectedPresetChanged) bridge.selectedPresetChanged.connect(onSelectedPresetChanged);
 
             // Show the current version in the footer.
             if (bridge.get_app_version) {
@@ -68,7 +74,14 @@ function initBridge() {
             // Re-enumerate whenever the user returns to this window (e.g. alt-tabs
             // back from the game), so a game launched after startup shows up without
             // having to Start the radar first.
-            window.addEventListener("focus", () => AR.refreshPrograms());
+            //
+            // Skipped while any <select> popup is open - it is the popup itself
+            // stealing and returning focus, and answering that churn with a
+            // blocking COM enumeration is what grew the list. See isSelectOpen.
+            window.addEventListener("focus", () => {
+                if (isSelectOpen()) return;
+                AR.refreshPrograms();
+            });
 
             resolve();
         });
@@ -110,6 +123,14 @@ function onProfilesChanged(jsonStr) {
     rebuildPresetSelects();
 }
 
+// The preset/profile selected in the last session, restored from settings.json.
+// Only records the name here - rebuildPresetSelects does the re-selecting, since
+// the matching option may not exist in the dropdown yet.
+function onSelectedPresetChanged(name) {
+    window._savedPreset = name || "";
+    rebuildPresetSelects();
+}
+
 function onProgramsChanged(jsonStr) {
     const progs = JSON.parse(jsonStr);
     // Diff-guard: refresh fires on dropdown-open and on every window focus, so
@@ -120,15 +141,11 @@ function onProgramsChanged(jsonStr) {
     if (sig === window._programsSig) return;
     window._programsSig = sig;
 
-    const sel = document.getElementById("program-select");
-    const prev = sel ? sel.value : "all";
+    // No preferred value: fillSelect keeps whatever the user has selected, and
+    // falls back to the first option ("All (system audio)") if that program has
+    // stopped playing and dropped off the list.
     fillSelect("program-select", [{ value: "all", label: "All (system audio)" },
         ...progs.map(p => ({ value: p, label: p }))]);
-    // Keep the user's current choice when the list refreshes on dropdown-open.
-    if (sel) {
-        const stillThere = Array.from(sel.options).some(o => o.value === prev);
-        sel.value = stillThere ? prev : "all";
-    }
 }
 
 // Saved overlay appearance (accent colour + thickness) restored from settings.json.
@@ -150,12 +167,25 @@ function onAppearanceChanged(jsonStr) {
     drawPreview();
 }
 
-// A built-in preset was applied in Python: move the frequency + max-amp sliders
-// and their readouts so the change is visible (the backend is already updated).
-// Setting an input's value in JS doesn't fire its oninput, so this won't loop
-// back into the bridge - the backend was set authoritatively by apply_preset.
-function onPresetApplied(jsonStr) {
+// Move the audio sliders and their readouts to match the backend. Sent on load
+// (the values restored from settings.json) and after a built-in preset is applied
+// - the backend is already authoritative in both cases, and setting an input's
+// value in JS does not fire its oninput, so this never loops back into the bridge.
+// Keys are optional, so a caller can push a subset.
+function onAudioSettingsChanged(jsonStr) {
     const p = JSON.parse(jsonStr);
+    if (p.sensitivity != null) {
+        const slider = Math.round(p.sensitivity * 10000);   // slider units = f * 10000
+        setSliderValue("sensitivity", slider);
+        setText("sensitivity-val", p.sensitivity.toFixed(4));
+        setFill("sensitivity", slider);
+    }
+    if (p.gain != null) {
+        const slider = Math.round(p.gain * 10);             // slider units = f * 10
+        setSliderValue("gain", slider);
+        setText("gain-val", p.gain.toFixed(1) + "x");
+        setFill("gain", slider);
+    }
     if (p.freq_low != null && p.freq_high != null) {
         document.getElementById("freq-low").value = p.freq_low;
         document.getElementById("freq-high").value = p.freq_high;
@@ -178,9 +208,9 @@ function onMonoStateChanged(jsonStr) {
         { value: "", label: "System default" + (s.default ? ` (${s.default})` : "") },
         ...(s.devices || []).map(d => ({ value: d, label: d })),
     ];
-    fillSelect("mono-output-select", opts);
-    const sel = document.getElementById("mono-output-select");
-    if (sel) sel.value = s.selected || "";
+    // "" is a real option value here (System default), so pass it through rather
+    // than letting it fall back to the current pick.
+    fillSelect("mono-output-select", opts, s.selected || "");
 
     const cb = document.getElementById("mono-enabled");
     if (cb) cb.checked = !!s.enabled;
@@ -228,10 +258,36 @@ function rebuildPresetSelects() {
         ...presets.map(n => ({ value: n, label: n })),
         ...profiles.map(n => ({ value: n, label: n + "  ★" })),  // ★ = saved profile
     ];
-    const cur = document.getElementById("preset-select")?.value;
-    fillSelect("preset-select", opts);
+    // Until the selection saved in settings.json has been restored, it outranks
+    // whatever the dropdown currently shows: presets and profiles arrive as two
+    // separate signals, so the first rebuild can land on an arbitrary entry
+    // simply because the list holding the saved one has not arrived yet. A saved
+    // name that no longer exists (a profile deleted since) falls back to the
+    // current pick rather than dropping the dropdown to its first entry.
+    const saved = window._presetRestored ? null : window._savedPreset;
+    const keep = document.getElementById("preset-select")?.value;
+    const want = (saved && opts.some(o => o.value === saved)) ? saved : keep;
+    // The restore replay is registered as this select's settled hook, so it also
+    // runs when the rebuild had to be deferred past an open popup.
+    fillSelect("preset-select", opts, want);
+}
+
+// Latch the restore once the saved name is actually showing in the dropdown,
+// which hands control of the selection back to the user (see rebuildPresetSelects).
+//
+// It deliberately does NOT re-apply the entry. A saved profile is a snapshot of
+// the colour, thickness, program and monitor as they were when it was saved, so
+// replaying it on every launch overwrote anything changed since. Those settings
+// are already restored from settings.json, one value at a time. The label can
+// therefore disagree with the sliders once you tune them by hand - that is
+// intended: the sliders are the truth, the name is a bookmark.
+function maybeRestorePreset() {
+    if (window._presetRestored) return;
+    const name = window._savedPreset;
+    if (!name) return;
     const sel = document.getElementById("preset-select");
-    if (sel && cur && opts.some(o => o.value === cur)) sel.value = cur;
+    if (!sel || sel.value !== name) return;   // not in the dropdown (yet)
+    window._presetRestored = true;
 }
 
 // ── AR namespace (JS → Python) ─────────────────────────────────────────
@@ -277,6 +333,11 @@ window.AR = {
 
     applyPreset(name) {
         if (!name) return;
+        // Remember the choice so it survives a restart. Also stops a stale saved
+        // name (e.g. a profile deleted since) from overriding this pick on the
+        // next dropdown rebuild.
+        window._presetRestored = true;
+        if (bridge.set_selected_preset) bridge.set_selected_preset(name);
         const profiles = window._profiles || {};
         if (profiles[name]) { applyProfileValues(profiles[name]); return; }   // saved profile
         bridge.apply_preset(name);                                            // built-in preset
@@ -302,6 +363,12 @@ window.AR = {
             accent_color: strVal("accent-color", "#9751F2"),
             thickness: intVal("thickness", 6),
         };
+        // Select the new profile as soon as it comes back in profilesChanged, by
+        // re-arming the restore latch: it selects a name the moment its option
+        // exists, which is exactly the problem here (the option does not exist
+        // yet). Python selects it on its side in save_profile, so both agree.
+        window._savedPreset = name;
+        window._presetRestored = false;
         bridge.save_profile(JSON.stringify(data));   // emits profilesChanged
     },
 
@@ -381,7 +448,10 @@ window.AR = {
     dismissUpdate() { toggleClass("update-banner", "is-hidden", true); },
 };
 
-// Apply a saved profile's values to the controls and push to Python.
+// Apply a saved profile's values to the controls and push to Python. Note that
+// each AR.* call below goes through the bridge, so the values land back in the
+// profile via the auto-update path - harmless, since they are the profile's own
+// values and the sync skips a write when nothing changed.
 // Richer fields (program/monitor/mono/appearance) are applied only when the
 // profile has them, so profiles saved by older versions still load fine and
 // simply leave those settings as they are.
@@ -497,9 +567,83 @@ function toggleClass(id, cls, on) { const el = document.getElementById(id); if (
 function intVal(id, def) { const el = document.getElementById(id); return el ? parseInt(el.value) : def; }
 function strVal(id, def) { const el = document.getElementById(id); return el ? el.value : def; }
 
-function fillSelect(id, opts) {
+// Rebuilds queued because their <select> was open at the time:
+// { id: {opts, preferred} }.
+const _pendingFills = {};
+
+// Follow-up work to run once a select's options have actually landed in the DOM.
+// Registered per id so a *deferred* fill still triggers what its caller expected
+// to happen right after the rebuild.
+const _fillSettled = { "preset-select": maybeRestorePreset };
+
+// QtWebEngine draws <select> popups natively (that is why the open list is white
+// instead of following our dark CSS - the popup is a Qt widget, not DOM). Two
+// consequences, and both feed the runaway-dropdown bug:
+//
+//   1. Swapping the options while the popup is open makes Qt GROW the rendered
+//      list instead of redrawing it, leaving a blank strip under the real
+//      entries that gets taller with every rebuild.
+//   2. The popup is a separate window, so opening it takes focus off the web
+//      view and hands it straight back, repeatedly, for as long as it stays
+//      open - and the focus handler answered every round with a blocking COM
+//      enumeration whose reply rebuilt the very list being displayed.
+//
+// `document.activeElement` stays on the <select> for as long as its popup is up,
+// so it answers both questions. It also stays there after the popup closes until
+// focus moves on, which only makes this over-cautious, never wrong.
+//
+// 49b828f fixed one instance by diff-guarding the program list, but that only
+// helps while the list is unchanged - any real change (a game starting or
+// stopping audio) still rebuilt an open popup. This is the general fix and
+// covers every dropdown, so it protects the preset list too.
+function isSelectOpen(sel) {
+    const active = document.activeElement;
+    if (!active || active.tagName !== "SELECT") return false;
+    return sel ? active === sel : true;
+}
+
+// Replace a <select>'s options. `preferred` is the value to end up selected;
+// omit it to keep the current pick. See applySelectOptions for the fallbacks.
+function fillSelect(id, opts, preferred) {
     const sel = document.getElementById(id);
     if (!sel) return;
+    if (isSelectOpen(sel)) {
+        // Flush on change AND blur: picking an entry closes the popup without
+        // blurring, and clicking away blurs without a change. `once` is safe
+        // because we only re-arm when another fill is queued.
+        if (!(id in _pendingFills)) {
+            sel.addEventListener("change", () => flushSelectFill(id, true), { once: true });
+            sel.addEventListener("blur", () => flushSelectFill(id), { once: true });
+        }
+        _pendingFills[id] = { opts, preferred };
+        return;
+    }
+    delete _pendingFills[id];
+    applySelectOptions(sel, opts, preferred);
+    _fillSettled[id]?.();
+}
+
+// Apply a rebuild that was deferred while the popup was open. `userPicked` marks
+// the flush as triggered by the user choosing an entry, so their choice outranks
+// whatever value the queued rebuild wanted.
+function flushSelectFill(id, userPicked) {
+    if (!(id in _pendingFills)) return;
+    const { opts, preferred } = _pendingFills[id];
+    delete _pendingFills[id];
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    applySelectOptions(sel, opts, userPicked ? sel.value : preferred);
+    _fillSettled[id]?.();
+}
+
+// Which entry ends up selected: `preferred` when the caller named one, else the
+// value already showing. Either way it is only assigned if the new list actually
+// contains it - assigning a value with no matching <option> leaves selectedIndex
+// at -1, which renders as an empty dropdown. Falling through to the first option
+// is what a rebuilt select does on its own; the explicit line just makes that
+// contract visible rather than inherited.
+function applySelectOptions(sel, opts, preferred) {
+    const want = preferred == null ? sel.value : String(preferred);
     sel.innerHTML = "";
     opts.forEach(o => {
         const opt = document.createElement("option");
@@ -507,6 +651,8 @@ function fillSelect(id, opts) {
         opt.textContent = o.label;
         sel.appendChild(opt);
     });
+    if (opts.some(o => String(o.value) === want)) sel.value = want;
+    else if (opts.length) sel.selectedIndex = 0;
 }
 
 // Paint the filled portion of a single slider via the --fill CSS var.
