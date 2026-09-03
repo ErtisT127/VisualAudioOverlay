@@ -281,8 +281,8 @@ body::before {
     width: 100%;
     -webkit-appearance: none;
     appearance: none;
-    height: 2px;
-    background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill, 30%), var(--track) var(--fill, 30%), var(--track) 100%);
+    height: 16px;
+    background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill, 30%), var(--track) var(--fill, 30%), var(--track) 100%) center / 100% 2px no-repeat;
     border-radius: 2px;
     outline: none;
 }
@@ -337,7 +337,13 @@ body::before {
 }
 
 /* ── Preset row (select + add/delete) ──────────────────────────── */
-.preset-row { display: flex; align-items: center; gap: 10px; }
+.preset-row { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 100%; }
+.preset-row .select-wrap--grow {
+    flex: 0 1 auto;
+    width: min(calc((100% - 28px) / 2), calc(100% - 182px));
+    min-width: 0;
+}
+.preset-control { width: 100%; margin-top: 0; margin-bottom: 0; }
 
 .icon-btn {
     flex: none;
@@ -353,6 +359,8 @@ body::before {
 }
 .icon-btn:hover { background: #2a2a2a; }
 .icon-btn .icon { width: 18px; height: 18px; }
+.icon-btn:disabled { opacity: 0.35; cursor: not-allowed; border-color: var(--track); }
+.icon-btn:disabled:hover { background: var(--card); }
 
 /* ── Settings two-column grid ──────────────────────────────────── */
 .settings-grid {
@@ -360,6 +368,7 @@ body::before {
     grid-template-columns: 1fr 1fr;
     gap: 28px;
 }
+.settings-col { min-width: 0; }
 .control { margin-bottom: 16px; }
 
 /* ── RADAR card ────────────────────────────────────────────────── */
@@ -528,6 +537,15 @@ body::before {
     font-size: 12px;
     opacity: 0.7;
 }
+.footer-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-dim);
+    text-decoration: none;
+}
+.footer-link:hover { color: var(--accent); }
+.footer-icon { width: 15px; height: 15px; }
 
 /* ── Update banner (hidden until a newer release is found) ──────────── */
 .update-banner {

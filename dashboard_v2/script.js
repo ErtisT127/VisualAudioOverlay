@@ -16,7 +16,7 @@
  *   programsChanged(jsonStr)    - list of running audio programs
  *
  *   set_selected_preset(str)      - persist the dropdown choice to settings.json
- *   selectedPresetChanged(str)    - that choice, restored on load (name only)
+ *   selectedPresetChanged(str)    - selected option state as JSON
  *   audioSettingsChanged(jsonStr) - the live sensitivity/gain/freq/max-amp, so the
  *                                   sliders follow a preset and come back on load
  *
@@ -32,6 +32,8 @@ let radarActive = false;
 let operationBusy = false;
 let operationState = "idle";
 let moveModeActive = false;
+let presetState = { id: "builtin:all-sounds", dirty: false };
+let presetApplying = false;
 
 // Project links (opened in the real browser via bridge.open_url). The update
 // banner overrides updateUrl when a specific release page is known.
@@ -125,7 +127,7 @@ function onMonitorsChanged(jsonStr) {
 }
 
 function onPresetsChanged(jsonStr) {
-    window._presets = JSON.parse(jsonStr);   // array of built-in preset names
+    window._presets = JSON.parse(jsonStr);   // builtin catalog
     rebuildPresetSelects();
 }
 
@@ -138,8 +140,17 @@ function onProfilesChanged(jsonStr) {
 // Only records the name here - rebuildPresetSelects does the re-selecting, since
 // the matching option may not exist in the dropdown yet.
 function onSelectedPresetChanged(name) {
-    window._savedPreset = name || "";
+    let state = null;
+    try { state = JSON.parse(name); } catch (_) {}
+    if (state && state.id) {
+        presetState = { id: state.id, dirty: !!state.dirty };
+        window._savedPreset = state.id;
+    } else {
+        window._savedPreset = name || "builtin:all-sounds";
+        presetState = { id: window._savedPreset, dirty: false };
+    }
     rebuildPresetSelects();
+    syncPresetButtons();
 }
 
 function onProgramsChanged(jsonStr) {
@@ -259,15 +270,16 @@ function onOverlayPositionChanged(jsonStr) {
 }
 
 // ── Preset / profile dropdowns ─────────────────────────────────────────
-// Built-in presets (read-only) + user profiles (addable/deletable) share
-// the dropdown. See handoff.md: merging presets+profiles is the intended
-// data model; true editable presets need a backend change.
+// The dropdown combines the permanent built-in catalog with user profiles.
 function rebuildPresetSelects() {
     const presets = window._presets || [];
     const profiles = Object.keys(window._profiles || {});
     const opts = [
-        ...presets.map(n => ({ value: n, label: n })),
-        ...profiles.map(n => ({ value: n, label: n + "  ★" })),  // ★ = saved profile
+        ...presets.map(p => ({
+            value: p.id,
+            label: p.name + (presetState.id === p.id && presetState.dirty ? " *" : ""),
+        })),
+        ...profiles.map(n => ({ value: `profile:${n}`, label: n + (presetState.id === `profile:${n}` && presetState.dirty ? " *" : "") })),
     ];
     // Until the selection saved in settings.json has been restored, it outranks
     // whatever the dropdown currently shows: presets and profiles arrive as two
@@ -277,21 +289,75 @@ function rebuildPresetSelects() {
     // current pick rather than dropping the dropdown to its first entry.
     const saved = window._presetRestored ? null : window._savedPreset;
     const keep = document.getElementById("preset-select")?.value;
-    const want = (saved && opts.some(o => o.value === saved)) ? saved : keep;
+    const stateId = presetState.id;
+    const want = (saved && opts.some(o => o.value === saved)) ? saved :
+        (opts.some(o => o.value === stateId) ? stateId :
+            (opts.some(o => o.value === keep) ? keep : opts[0]?.value));
     // The restore replay is registered as this select's settled hook, so it also
     // runs when the rebuild had to be deferred past an open popup.
     fillSelect("preset-select", opts, want);
 }
 
+function markPresetDirty() {
+    if (presetApplying) return;
+    const baseline = presetAudioValues(presetState.id);
+    presetState.dirty = baseline ? !audioValuesEqual(currentAudioValues(), baseline) : true;
+    rebuildPresetSelects();
+    syncPresetButtons();
+    if (bridge.set_preset_state) bridge.set_preset_state(JSON.stringify(presetState));
+}
+
+function currentAudioValues() {
+    return {
+        sensitivity: intVal("sensitivity", 50),
+        gain: intVal("gain", 10),
+        freq_low: intVal("freq-low", 150),
+        freq_high: intVal("freq-high", 4000),
+        max_amp: intVal("max-amp", 100),
+    };
+}
+
+function presetAudioValues(id) {
+    if (id === "builtin:all-sounds") {
+        return { sensitivity: 50, gain: 10, freq_low: 20, freq_high: 20000, max_amp: 100 };
+    }
+    if (id?.startsWith("profile:")) {
+        const profile = (window._profiles || {})[id.slice(8)];
+        if (!profile) return null;
+        return {
+            sensitivity: profile.sensitivity ?? 50,
+            gain: profile.gain ?? 10,
+            freq_low: profile.freq_low ?? 150,
+            freq_high: profile.freq_high ?? 4000,
+            max_amp: profile.max_amp ?? 100,
+        };
+    }
+    return null;
+}
+
+function audioValuesEqual(a, b) {
+    return ["sensitivity", "gain", "freq_low", "freq_high", "max_amp"]
+        .every(key => Number(a[key]) === Number(b[key]));
+}
+
+function syncPresetButtons() {
+    const reset = document.getElementById("preset-reset-btn");
+    const save = document.getElementById("preset-save-btn");
+    const del = document.getElementById("preset-delete-btn");
+    if (reset) reset.disabled = !presetState.dirty;
+    if (save) {
+        save.disabled = !presetState.dirty || !presetState.id.startsWith("profile:");
+        save.title = "Save preset";
+        save.setAttribute("aria-label", save.title);
+    }
+    if (del) del.disabled = !presetState.id.startsWith("profile:");
+}
+
 // Latch the restore once the saved name is actually showing in the dropdown,
 // which hands control of the selection back to the user (see rebuildPresetSelects).
 //
-// It deliberately does NOT re-apply the entry. A saved profile is a snapshot of
-// the colour, thickness, program and monitor as they were when it was saved, so
-// replaying it on every launch overwrote anything changed since. Those settings
-// are already restored from settings.json, one value at a time. The label can
-// therefore disagree with the sliders once you tune them by hand - that is
-// intended: the sliders are the truth, the name is a bookmark.
+// It deliberately does NOT re-apply the entry. Live settings are restored one
+// value at a time, so merely restoring the selection cannot overwrite them.
 function maybeRestorePreset() {
     if (window._presetRestored) return;
     const name = window._savedPreset;
@@ -299,6 +365,17 @@ function maybeRestorePreset() {
     const sel = document.getElementById("preset-select");
     if (!sel || sel.value !== name) return;   // not in the dropdown (yet)
     window._presetRestored = true;
+}
+
+function profileData(name) {
+    return {
+        name,
+        sensitivity: intVal("sensitivity", 50),
+        gain: intVal("gain", 10),
+        freq_low: intVal("freq-low", 150),
+        freq_high: intVal("freq-high", 4000),
+        max_amp: intVal("max-amp", 100),
+    };
 }
 
 // ── AR namespace (JS → Python) ─────────────────────────────────────────
@@ -315,6 +392,7 @@ window.AR = {
         setText("sensitivity-val", f.toFixed(4));
         setFill("sensitivity", val);
         bridge.set_sensitivity(f);
+        markPresetDirty();
     },
 
     setGain(val) {
@@ -322,6 +400,7 @@ window.AR = {
         setText("gain-val", f.toFixed(1) + "x");
         setFill("gain", val);
         bridge.set_gain(f);
+        markPresetDirty();
     },
 
     setMaxAmp(val) {
@@ -329,6 +408,7 @@ window.AR = {
         setText("max-amp-val", f.toFixed(2));
         setFill("max-amp", val);
         bridge.set_max_amplitude(f);
+        markPresetDirty();
     },
 
     // Frequency is in real Hz (locked decision). Dual handles.
@@ -341,6 +421,7 @@ window.AR = {
         setText("freq-val", `${low}-${high} Hz`);
         updateDualFill();
         bridge.set_freq_range(low, high);
+        markPresetDirty();
     },
 
     applyPreset(name) {
@@ -349,49 +430,61 @@ window.AR = {
         // name (e.g. a profile deleted since) from overriding this pick on the
         // next dropdown rebuild.
         window._presetRestored = true;
-        if (bridge.set_selected_preset) bridge.set_selected_preset(name);
         const profiles = window._profiles || {};
-        if (profiles[name]) { applyProfileValues(profiles[name]); return; }   // saved profile
-        bridge.apply_preset(name);                                            // built-in preset
+        if (name.startsWith("profile:")) {
+            const profileName = name.slice(8);
+            if (!profiles[profileName]) return;
+            presetApplying = true;
+            applyProfileValues(profiles[profileName]);
+            presetApplying = false;
+        } else {
+            presetApplying = true;
+            bridge.apply_preset(name);
+            presetApplying = false;
+        }
+        presetState = { id: name, dirty: false };
+        if (bridge.set_selected_preset) bridge.set_selected_preset(name);
+        rebuildPresetSelects();
+        syncPresetButtons();
     },
 
     addPreset() {
-        const name = (window.prompt("Name this preset:") || "").trim();
+        const name = (window.prompt("New preset name") || "").trim();
         if (!name) return;
-        const data = {
-            name,
-            sensitivity: intVal("sensitivity", 50),
-            gain: intVal("gain", 10),
-            freq_low: intVal("freq-low", 150),
-            freq_high: intVal("freq-high", 4000),
-            max_amp: intVal("max-amp", 100),
-            preset: "Custom",
-            // Richer profiles: also capture the target program, monitor, mono
-            // state, and overlay appearance, so "CS2" restores everything.
-            program: strVal("program-select", "all"),
-            monitor: intVal("monitor-select", 0),
-            mono_enabled: !!document.getElementById("mono-enabled")?.checked,
-            mono_device: strVal("mono-output-select", ""),
-            accent_color: strVal("accent-color", "#9751F2"),
-            thickness: intVal("thickness", 6),
-        };
-        // Select the new profile as soon as it comes back in profilesChanged, by
-        // re-arming the restore latch: it selects a name the moment its option
-        // exists, which is exactly the problem here (the option does not exist
-        // yet). Python selects it on its side in save_profile, so both agree.
-        window._savedPreset = name;
-        window._presetRestored = false;
-        bridge.save_profile(JSON.stringify(data));   // emits profilesChanged
+        bridge.save_profile(JSON.stringify(profileData(name)));
+        presetState = { id: `profile:${name}`, dirty: false };
+        if (bridge.set_selected_preset) bridge.set_selected_preset(presetState.id);
+        rebuildPresetSelects();
+        syncPresetButtons();
+    },
+
+    resetPreset() {
+        if (!presetState.dirty || !presetState.id) return;
+        AR.applyPreset(presetState.id);
+    },
+
+    savePreset() {
+        if (!presetState.dirty) return;
+        if (!presetState.id.startsWith("profile:")) return;
+        const name = presetState.id.slice(8);
+        bridge.save_profile(JSON.stringify(profileData(name)));
+        presetState = { id: `profile:${name}`, dirty: false };
+        if (bridge.set_selected_preset) bridge.set_selected_preset(presetState.id);
+        rebuildPresetSelects();
+        syncPresetButtons();
     },
 
     deletePreset() {
         const sel = document.getElementById("preset-select");
-        const name = sel?.value;
+        const id = sel?.value;
+        if (!id || !id.startsWith("profile:")) return;
+        const name = id.slice(8);
         if (!name) return;
         if (!(window._profiles || {})[name]) {
             window.alert("Built-in presets can't be deleted - only saved presets (★).");
             return;
         }
+        if (!window.confirm(`Delete preset \"${name}\"?`)) return;
         bridge.delete_profile(name);
     },
 
@@ -453,16 +546,12 @@ window.AR = {
 
     // ── Update banner ─────────────────────────────────────────────────
     openUpdate() { openExternal(updateUrl); },
+    openRepo() { openExternal(REPO_URL); },
     dismissUpdate() { toggleClass("update-banner", "is-hidden", true); },
 };
 
-// Apply a saved profile's values to the controls and push to Python. Note that
-// each AR.* call below goes through the bridge, so the values land back in the
-// profile via the auto-update path - harmless, since they are the profile's own
-// values and the sync skips a write when nothing changed.
-// Richer fields (program/monitor/mono/appearance) are applied only when the
-// profile has them, so profiles saved by older versions still load fine and
-// simply leave those settings as they are.
+// Apply only the audio settings stored in a profile. Other dashboard settings
+// are intentionally independent from preset selection.
 function applyProfileValues(p) {
     setSliderValue("sensitivity", p.sensitivity ?? 50);
     setSliderValue("gain", p.gain ?? 10);
@@ -474,47 +563,6 @@ function applyProfileValues(p) {
     AR.setMaxAmp(intVal("max-amp", 100));
     AR.setFreqRange();
 
-    if (p.program != null) {
-        const sel = document.getElementById("program-select");
-        if (sel) {
-            // The saved game may not be running (yet) - inject its option so
-            // the dropdown shows the choice; the backend falls back to system
-            // audio with a status message until the program plays audio.
-            if (!Array.from(sel.options).some(o => o.value === p.program)) {
-                const opt = document.createElement("option");
-                opt.value = p.program;
-                opt.textContent = p.program;
-                sel.appendChild(opt);
-            }
-            sel.value = p.program;
-        }
-        AR.setProgram(p.program);
-    }
-
-    if (p.monitor != null) {
-        const sel = document.getElementById("monitor-select");
-        if (sel) sel.value = p.monitor;
-        AR.setMonitor(p.monitor);
-    }
-
-    // Device before enable, so turning mono on starts on the right output.
-    // monoStateChanged echoes back and re-syncs the checkbox/select/hint.
-    if (p.mono_device != null && bridge.set_mono_output) {
-        bridge.set_mono_output(p.mono_device);
-    }
-    if (p.mono_enabled != null && bridge.set_mono_enabled) {
-        bridge.set_mono_enabled(!!p.mono_enabled);
-    }
-
-    if (p.accent_color) {
-        const ac = document.getElementById("accent-color");
-        if (ac) ac.value = p.accent_color;
-        AR.setAccentColor(p.accent_color);
-    }
-    if (p.thickness != null) {
-        setSliderValue("thickness", p.thickness);
-        AR.setThickness(p.thickness);
-    }
 }
 
 // ── Preview canvas - mirrors overlay.py rendering ──────────────────────
@@ -737,4 +785,5 @@ function AR_initLocal() {
     setText("freq-val", "150-4000 Hz");
     updateColorReadout("#9751F2");
     drawPreview();
+    syncPresetButtons();
 }

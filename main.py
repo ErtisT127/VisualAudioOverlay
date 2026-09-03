@@ -1,6 +1,6 @@
 # nuitka-project: --onefile
 # nuitka-project: --enable-plugin=pyqt6
-# nuitka-project: --include-qt-plugins=all
+# nuitka-project: --noinclude-qt-translations
 # nuitka-project: --windows-console-mode=disable
 # nuitka-project: --windows-icon-from-ico=assets/icon.ico
 # nuitka-project: --output-dir=dist/nuitka
@@ -13,7 +13,11 @@
 # nuitka-project: --include-module=mono_output
 # nuitka-project: --include-module=process_loopback
 # nuitka-project: --include-package=comtypes
+# nuitka-project: --nofollow-import-to=comtypes.test
+# nuitka-project: --nofollow-import-to=comtypes.test.*
 # nuitka-project: --include-package=pycaw
+# nuitka-project: --nofollow-import-to=pycaw.test
+# nuitka-project: --nofollow-import-to=pycaw.test.*
 # nuitka-project: --include-package=soundcard
 # nuitka-project: --include-package=psutil
 
@@ -27,8 +31,9 @@ from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QSystemTrayIcon
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMainWindow, QMenu, QSystemTrayIcon
 
 from audio_capture import AudioCaptureThread
 from overlay import OverlayRadar
@@ -101,15 +106,13 @@ _UPDATE_CHECK_STARTED = False
 # them without reintroducing the leak.
 _PRESET_LEVEL_DEFAULTS = {"sensitivity": 0.005, "gain": 1.0}
 SOUND_PRESETS = {
-    name: {**_PRESET_LEVEL_DEFAULTS, **band}
-    for name, band in {
-        "All Sounds": {"freq_low": 20, "freq_high": 20000, "max_amp": 1.0},
-        "Footsteps - CS2": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
-        "Footsteps - Valorant": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.12},
-        "Footsteps - Fortnite": {"freq_low": 150, "freq_high": 5000, "max_amp": 0.18},
-        "Footsteps - General": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
-        "Custom": {"freq_low": 150, "freq_high": 4000, "max_amp": 1.0},
-    }.items()
+    "All Sounds": {**_PRESET_LEVEL_DEFAULTS, "freq_low": 20, "freq_high": 20000, "max_amp": 1.0}
+}
+INITIAL_PROFILE_PRESETS = {
+    "Footsteps - CS2": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
+    "Footsteps - Valorant": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.12},
+    "Footsteps - Fortnite": {"freq_low": 150, "freq_high": 5000, "max_amp": 0.18},
+    "Footsteps - General": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
 }
 
 # Saved profiles store SLIDER POSITIONS (that is what AR.addPreset reads out of
@@ -124,6 +127,22 @@ PROFILE_SLIDER_SCALE = {
     "freq_low": 1,
     "freq_high": 1,
 }
+
+
+def _initial_profiles() -> dict:
+    """Build the editable profiles written on a genuinely fresh install."""
+    profiles = {}
+    for name, band in INITIAL_PROFILE_PRESETS.items():
+        values = {**_PRESET_LEVEL_DEFAULTS, **band}
+        profiles[name] = {
+            "name": name,
+            "sensitivity": round(values["sensitivity"] * PROFILE_SLIDER_SCALE["sensitivity"]),
+            "gain": round(values["gain"] * PROFILE_SLIDER_SCALE["gain"]),
+            "freq_low": values["freq_low"],
+            "freq_high": values["freq_high"],
+            "max_amp": round(values["max_amp"] * PROFILE_SLIDER_SCALE["max_amp"]),
+        }
+    return profiles
 
 
 def _load_json_mapping(path: str) -> dict:
@@ -235,13 +254,37 @@ class ProgramListThread(QThread):
         self.result.emit(json.dumps(names))
 
 
+class AppWebEnginePage(QWebEnginePage):
+    """Use the application name for JavaScript alert dialogs."""
+
+    def javaScriptAlert(self, security_origin, message):
+        from PyQt6.QtWidgets import QMessageBox
+
+        QMessageBox.information(self.parent(), "Visual Audio Overlay", message)
+
+    def javaScriptPrompt(self, security_origin, message, default_value):
+        value, accepted = QInputDialog.getText(
+            self.parent(), "New preset", message, text=default_value
+        )
+        return accepted, value
+
+    def javaScriptConfirm(self, security_origin, message):
+        from PyQt6.QtWidgets import QMessageBox
+
+        answer = QMessageBox.question(
+            self.parent(), "Delete preset", message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+
 class Bridge(QObject):
     # Signals → pushed to JS
     statusChanged = pyqtSignal(str, bool)  # (message, isActive)
     deviceChanged = pyqtSignal(str)  # detected device name
     profilesChanged = pyqtSignal(str)  # full profiles dict as JSON
     monitorsChanged = pyqtSignal(str)  # list of monitors as JSON
-    presetsChanged = pyqtSignal(str)  # list of preset names as JSON
+    presetsChanged = pyqtSignal(str)  # permanent builtin catalog as JSON
     programsChanged = pyqtSignal(str)  # running audio programs as JSON
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
     monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
@@ -249,9 +292,7 @@ class Bridge(QObject):
     appearanceChanged = pyqtSignal(
         str
     )  # saved overlay accent colour + thickness as JSON
-    selectedPresetChanged = pyqtSignal(
-        str
-    )  # preset/profile name to restore in the dropdown
+    selectedPresetChanged = pyqtSignal(str)  # internal preset option key
     audioSettingsChanged = pyqtSignal(
         str
     )  # all five live audio params, so JS moves the sliders
@@ -297,6 +338,20 @@ class Bridge(QObject):
     def set_selected_preset(self, name: str):
         self._app.set_selected_preset(name)
 
+    @pyqtSlot(str)
+    def set_preset_state(self, json_str: str):
+        try:
+            state = json.loads(json_str)
+            if isinstance(state, dict):
+                self._app.settings["preset_state"] = {
+                    "id": str(state.get("id", "builtin:all-sounds")),
+                    "dirty": bool(state.get("dirty", False)),
+                }
+                self._app.preset_state = dict(self._app.settings["preset_state"])
+                self._app._queue_settings_save()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
     @pyqtSlot(bool)
     def set_invert(self, invert: bool):
         self._app.invert_direction = invert
@@ -304,7 +359,6 @@ class Bridge(QObject):
     @pyqtSlot(int)
     def set_monitor(self, idx: int):
         self._app.selected_monitor = idx
-        self._app._queue_settings_save()
 
     @pyqtSlot(str)
     def set_program(self, value: str):
@@ -381,21 +435,16 @@ class Bridge(QObject):
     # ── Profiles ──────────────────────────────────────────────────────
     @pyqtSlot(str)
     def save_profile(self, json_str: str):
-        """Expects JSON with at least { name } plus whatever the UI captures:
-        sensitivity, gain, preset, freq_low, freq_high, max_amp, invert, and
-        (since richer profiles) program, monitor, mono_enabled, mono_device,
-        accent_color, thickness. Older profiles missing keys still load."""
+        """Persist the audio settings captured by the preset editor."""
         try:
             data = json.loads(json_str)
             name = data.get("name", "").strip()
             if not name:
                 return
+            data["name"] = name
             self._app.profiles[name] = data
             self._app._save_profiles()
-            # The profile you just made is the one you are working in - selecting
-            # it is what puts later changes on the auto-update path. The dashboard
-            # selects it in the dropdown off the same name (see AR.addPreset).
-            self._app.set_selected_preset(name)
+            self._app.set_selected_preset(f"profile:{name}")
             self.profilesChanged.emit(json.dumps(self._app.profiles))
         except Exception as e:
             print(f"save_profile error: {e}")
@@ -415,8 +464,8 @@ class Bridge(QObject):
             # in settings.json that no dropdown entry can ever match, so nothing
             # would be restored on the next launch and the label would drift from
             # the running band. Fall back to the neutral preset.
-            if self._app.selected_preset == name:
-                self._app.set_selected_preset("All Sounds")
+            if self._app.selected_preset == f"profile:{name}":
+                self._app.set_selected_preset("builtin:all-sounds")
                 self._app.emit_selected_preset()
             self.profilesChanged.emit(json.dumps(self._app.profiles))
 
@@ -453,8 +502,10 @@ class Bridge(QObject):
         # Profiles
         self.profilesChanged.emit(json.dumps(self._app.profiles))
 
-        # Presets
-        self.presetsChanged.emit(json.dumps(list(SOUND_PRESETS.keys())))
+        # Permanent builtin preset. Other initial presets live in profiles.json.
+        self.presetsChanged.emit(json.dumps([
+            {"id": "builtin:all-sounds", "name": "All Sounds", "can_delete": False}
+        ]))
 
         # Running audio programs (for per-app capture)
         self._app.emit_programs()
@@ -499,8 +550,22 @@ class AudioRadarApp(QMainWindow):
         self.invert_direction = False
         self.selected_monitor = 0
         self.selected_program = None  # None = whole-system audio; else a program name
+        fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(SETTINGS_FILE)
         self.profiles = self._load_profiles()
         self.settings = self._load_settings()
+        # Monitor and program are session-only choices; never restore stale
+        # values from a previous run.
+        removed_session_keys = any(
+            self.settings.pop(key, None) is not None
+            for key in ("selected_monitor", "selected_program")
+        )
+        if fresh_install:
+            self.profiles = _initial_profiles()
+            self._save_profiles()
+            self.settings["audio_settings"] = dict(SOUND_PRESETS["All Sounds"])
+            self._save_settings()
+        elif removed_session_keys:
+            self._save_settings()
         self.radar_active = False
 
         # Live audio parameters, held here as the source of truth so they survive
@@ -512,8 +577,8 @@ class AudioRadarApp(QMainWindow):
         self.audio_settings = {
             "sensitivity": 0.005,  # sens slider 50 / 10000
             "gain": 1.0,  # gain slider 10 / 10
-            "freq_low": 150,  # freq slider default (matches SOUND_PRESETS)
-            "freq_high": 4000,
+            "freq_low": 20,  # All Sounds default
+            "freq_high": 20000,
             "max_amp": 1.0,  # max-amp slider 100 / 100
         }
         # ...and restored from settings.json on top of those defaults, so a tuned
@@ -543,8 +608,28 @@ class AudioRadarApp(QMainWindow):
         self.selected_preset = (
             saved_preset
             if isinstance(saved_preset, str) and saved_preset
-            else "All Sounds"
+            else "builtin:all-sounds"
         )
+        saved_state = self.settings.get("preset_state")
+        self.preset_state = saved_state if isinstance(saved_state, dict) else {
+            "id": self.selected_preset,
+            "dirty": False,
+        }
+        value = self.preset_state.get("id", "")
+        valid = value == "builtin:all-sounds" or (
+            isinstance(value, str) and value.startswith("profile:")
+            and value[8:] in self.profiles
+        )
+        if not valid:
+            self.preset_state = {"id": "builtin:all-sounds", "dirty": False}
+        else:
+            self.preset_state = {
+                "id": value,
+                "dirty": bool(self.preset_state.get("dirty", False)),
+            }
+        self.selected_preset = self.preset_state["id"]
+        self.settings["selected_preset"] = self.selected_preset
+        self.settings["preset_state"] = dict(self.preset_state)
 
         # Mono output (single-sided listeners). Persisted in settings.json so the
         # user's choice survives restarts; applied to the audio thread on Start.
@@ -578,6 +663,7 @@ class AudioRadarApp(QMainWindow):
 
         # WebEngine view
         self.view = QWebEngineView()
+        self.view.setPage(AppWebEnginePage(self.view))
 
         # WebChannel - registers `bridge` as `window.bridge` in JS
         self.channel = QWebChannel()
@@ -704,7 +790,6 @@ class AudioRadarApp(QMainWindow):
         if program == self.selected_program:
             return
         self.selected_program = program
-        self._queue_settings_save()
         self._restart_capture_if_active()
 
     def list_programs(self):
@@ -880,16 +965,13 @@ class AudioRadarApp(QMainWindow):
                     pass
 
     def _queue_settings_save(self):
-        """Stage the live audio parameters and debounce the write (see the timer).
-        Also the entry point for the profile auto-update, so every setter that
-        changes something a profile stores should call this."""
+        """Stage live settings and debounce the disk write."""
         self.settings["audio_settings"] = dict(self.audio_settings)
         self._settings_save_timer.start()
 
     def _write_pending_saves(self):
-        """The debounced write itself: settings.json, then the selected profile."""
+        """The debounced write itself: settings.json only."""
         self._save_settings()
-        self._sync_selected_profile()
 
     def _flush_pending_saves(self):
         """Write a pending change now instead of waiting the debounce out. Used on
@@ -898,38 +980,6 @@ class AudioRadarApp(QMainWindow):
         if self._settings_save_timer.isActive():
             self._settings_save_timer.stop()
             self._write_pending_saves()
-
-    def _sync_selected_profile(self):
-        """Auto-update: while one of the user's own profiles is selected, live
-        changes are written back into it, so switching away and back returns the
-        values you last had rather than the snapshot taken when it was created.
-
-        Built-in presets are read-only and fall straight through - `profiles` only
-        ever holds user-made entries, so the lookup is the whole check."""
-        prof = self.profiles.get(self.selected_preset)
-        if prof is None:
-            return
-        updated = {
-            k: round(self.audio_settings[k] * scale)
-            for k, scale in PROFILE_SLIDER_SCALE.items()
-        }
-        updated.update(
-            {
-                "program": self.selected_program or "all",
-                "monitor": self.selected_monitor,
-                "mono_enabled": self.mono_enabled,
-                "mono_device": self.mono_device or "",
-                "accent_color": self.accent_color,
-                "thickness": self.stroke_width,
-            }
-        )
-        if all(prof.get(k) == v for k, v in updated.items()):
-            return  # nothing moved: no disk write, no rebuild
-        prof.update(updated)
-        self._save_profiles()
-        # The dashboard caches profiles to feed applyProfileValues, so it has to
-        # see the new values or switching back would replay the stale ones.
-        self.bridge.profilesChanged.emit(json.dumps(self.profiles))
 
     def emit_audio_settings(self):
         """Push the live audio parameters to the dashboard so the sliders show what
@@ -951,16 +1001,21 @@ class AudioRadarApp(QMainWindow):
         no-op guard matters anyway - the dashboard replays the restored name
         through the same path a click takes, which would otherwise rewrite the
         file with identical contents on every launch."""
-        name = name or ""
+        name = name or "builtin:all-sounds"
         if name == self.selected_preset:
             return
         self._flush_pending_saves()
         self.selected_preset = name
+        self.preset_state = {"id": name, "dirty": False}
         self.settings["selected_preset"] = name
+        self.settings["preset_state"] = dict(self.preset_state)
         self._save_settings()
 
     def emit_selected_preset(self):
-        self.bridge.selectedPresetChanged.emit(self.selected_preset)
+        self.bridge.selectedPresetChanged.emit(json.dumps({
+            "id": self.preset_state.get("id", self.selected_preset),
+            "dirty": bool(self.preset_state.get("dirty", False)),
+        }))
 
     def apply_preset(self, name: str):
         """Apply a built-in preset and echo the values back to the dashboard so the
@@ -969,7 +1024,9 @@ class AudioRadarApp(QMainWindow):
 
         Every parameter is overwritten, never just the ones the preset cares about
         - see the note on SOUND_PRESETS for why a partial apply leaks."""
-        p = SOUND_PRESETS.get(name, SOUND_PRESETS["All Sounds"])
+        if name != "builtin:all-sounds":
+            return
+        p = SOUND_PRESETS["All Sounds"]
         for key in self.audio_settings:
             self.audio_settings[key] = p[key]
         self._apply_audio_settings_to_thread()
@@ -1044,6 +1101,9 @@ class AudioRadarApp(QMainWindow):
             self._pending_capture_restart = False
             self._capture_terminal_error = None
             self._new_audio_thread()
+            # Finishing the old capture hides the overlay; show it again for the
+            # replacement thread without moving the user's chosen position.
+            self.overlay.show()
             self._set_operation_state("starting")
             self._start_capture_thread()
             self._capture_watchdog.start()
@@ -1074,9 +1134,9 @@ class AudioRadarApp(QMainWindow):
         overlay stays up; only the capture source blips out for a moment."""
         if not self.radar_active:
             return
-        self.audio_thread.request_stop()
-        self._set_operation_state("stopping")
         self._pending_capture_restart = True
+        self._set_operation_state("stopping")
+        self.audio_thread.request_stop()
 
     def stop_radar(self):
         if self.radar_operation_state != "idle":
@@ -1160,6 +1220,10 @@ class AudioRadarApp(QMainWindow):
     # ── Profiles ──────────────────────────────────────────────────────
     def _load_profiles(self) -> dict:
         profiles = _load_json_mapping(PROFILES_FILE)
+        if not all(isinstance(name, str) and isinstance(profile, dict)
+                   for name, profile in profiles.items()):
+            print(f"Ignoring incompatible profiles file: {PROFILES_FILE}")
+            profiles = {}
         if not os.path.exists(PROFILES_FILE):
             _save_json_mapping(PROFILES_FILE, profiles)
         return profiles
@@ -1169,6 +1233,9 @@ class AudioRadarApp(QMainWindow):
 
     def _load_settings(self) -> dict:
         settings = _load_json_mapping(SETTINGS_FILE)
+        if not isinstance(settings, dict):
+            print(f"Ignoring incompatible settings file: {SETTINGS_FILE}")
+            settings = {}
         if not os.path.exists(SETTINGS_FILE):
             _save_json_mapping(SETTINGS_FILE, settings)
         return settings
