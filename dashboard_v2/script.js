@@ -29,14 +29,13 @@
  */
 
 let radarActive = false;
+let operationBusy = false;
+let operationState = "idle";
 let moveModeActive = false;
 
 // Project links (opened in the real browser via bridge.open_url). The update
 // banner overrides updateUrl when a specific release page is known.
-const REPO_URL = "https://github.com/mike-s-zaugg/VisualAudioOverlay";
-const FEEDBACK_URL = REPO_URL + "/issues/new/choose";
-const CONTRIBUTE_URL = REPO_URL + "/blob/main/CONTRIBUTING.md";
-const COFFEE_URL = "https://buymeacoffee.com/mikezaugg";
+const REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay";
 let updateUrl = REPO_URL + "/releases/latest";
 
 function openExternal(url) {
@@ -62,6 +61,8 @@ function initBridge() {
             if (bridge.appearanceChanged) bridge.appearanceChanged.connect(onAppearanceChanged);
             if (bridge.audioSettingsChanged) bridge.audioSettingsChanged.connect(onAudioSettingsChanged);
             if (bridge.selectedPresetChanged) bridge.selectedPresetChanged.connect(onSelectedPresetChanged);
+            if (bridge.operationBusyChanged) bridge.operationBusyChanged.connect(onOperationBusyChanged);
+            if (bridge.operationStateChanged) bridge.operationStateChanged.connect(onOperationStateChanged);
 
             // Show the current version in the footer.
             if (bridge.get_app_version) {
@@ -102,9 +103,19 @@ function onStatusChanged(message, isActive) {
     syncToggleUI();
 }
 
+function onOperationBusyChanged(busy) {
+    operationBusy = !!busy;
+    syncToggleUI();
+}
+
+function onOperationStateChanged(state) {
+    operationState = state || "idle";
+    syncToggleUI();
+}
+
 function onDeviceChanged(label) {
     // label is "Name  (Nch)" - split the channel suffix onto its own line
-    const m = label.match(/^(.*?)\s*\((.*)\)\s*$/);
+    const m = label.match(/^(.*)\s+\(([^()]*)\)\s*$/);
     if (m) { setText("device-name", m[1].trim()); setText("device-channels", m[2].trim()); }
     else { setText("device-name", label); setText("device-channels", ""); }
 }
@@ -293,6 +304,7 @@ function maybeRestorePreset() {
 // ── AR namespace (JS → Python) ─────────────────────────────────────────
 window.AR = {
     toggleRadar() {
+        if (operationBusy) return;
         if (radarActive) bridge.stop_radar();
         else bridge.start_radar();
         // UI syncs authoritatively via statusChanged
@@ -439,11 +451,7 @@ window.AR = {
         drawPreview();
     },
 
-    // ── Footer support links + update banner ──────────────────────────
-    openRepo() { openExternal(REPO_URL); },
-    openFeedback() { openExternal(FEEDBACK_URL); },
-    openContribute() { openExternal(CONTRIBUTE_URL); },
-    openCoffee() { openExternal(COFFEE_URL); },
+    // ── Update banner ─────────────────────────────────────────────────
     openUpdate() { openExternal(updateUrl); },
     dismissUpdate() { toggleClass("update-banner", "is-hidden", true); },
 };
@@ -681,8 +689,11 @@ function syncToggleUI() {
     const btn = document.getElementById("btn-toggle");
     const dot = document.getElementById("status-dot");
     if (btn) {
-        btn.textContent = radarActive ? "End" : "Start";
-        btn.classList.toggle("is-active", radarActive);
+        if (operationState === "starting") btn.textContent = "Starting...";
+        else if (operationState === "stopping") btn.textContent = "Stopping...";
+        else btn.textContent = radarActive ? "End" : "Start";
+        btn.classList.toggle("is-active", radarActive && operationState === "idle");
+        btn.disabled = operationBusy;
     }
     if (dot) {
         dot.classList.toggle("status-dot--on", radarActive);

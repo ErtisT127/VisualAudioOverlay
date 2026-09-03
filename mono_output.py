@@ -77,8 +77,13 @@ class MonoMixThread(QThread):
 
     failed = pyqtSignal(str)
 
-    def __init__(self, device_name: str | None = None, samplerate: int = 48000,
-                 out_channels: int = 2, queue_max: int = 8):
+    def __init__(
+        self,
+        device_name: str | None = None,
+        samplerate: int = 48000,
+        out_channels: int = 2,
+        queue_max: int = 8,
+    ):
         super().__init__()
         self.device_name = device_name or None
         self.samplerate = samplerate
@@ -95,7 +100,7 @@ class MonoMixThread(QThread):
             self._q.put_nowait(stereo_chunk)
         except queue.Full:
             try:
-                self._q.get_nowait()       # drop oldest
+                self._q.get_nowait()  # drop oldest
                 self._q.put_nowait(stereo_chunk)
             except queue.Empty:
                 pass
@@ -116,8 +121,9 @@ class MonoMixThread(QThread):
             if speaker is None:
                 self.failed.emit("no output device for mono playback")
                 return
-            with speaker.player(samplerate=self.samplerate,
-                                channels=self.out_channels) as player:
+            with speaker.player(
+                samplerate=self.samplerate, channels=self.out_channels
+            ) as player:
                 while self._running:
                     try:
                         chunk = self._q.get(timeout=0.2)
@@ -135,9 +141,11 @@ class MonoMixThread(QThread):
         if data.ndim == 1:
             mono = data
         else:
-            mono = data.mean(axis=1)
-        out = np.repeat(mono[:, None], self.out_channels, axis=1)
-        return np.ascontiguousarray(out, dtype=np.float32)
+            mono = data.mean(axis=1, dtype=np.float32)
+        mono = np.asarray(mono, dtype=np.float32)
+        out = np.empty((len(mono), self.out_channels), dtype=np.float32)
+        out[:] = mono[:, None]
+        return out
 
     def stop(self):
         self._running = False

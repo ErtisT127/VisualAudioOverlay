@@ -6,8 +6,28 @@ dragging in soundcard/COM.
 """
 
 import math
+from functools import lru_cache
 
 import numpy as np
+
+
+@lru_cache(maxsize=32)
+def _band_plan(n, samplerate, freq_low, freq_high):
+    """Cache frequency-domain metadata; these arrays never change per call."""
+    window = np.hanning(n)
+    freqs = np.fft.rfftfreq(n, d=1.0 / samplerate)
+    in_band = (freqs >= freq_low) & (freqs <= freq_high)
+
+    weights = np.full(len(freqs), 2.0)
+    weights[0] = 1.0
+    if n % 2 == 0:
+        weights[-1] = 1.0
+
+    band_weights = weights * in_band
+    window_power = np.mean(window**2)
+    for array in (window, band_weights):
+        array.setflags(write=False)
+    return window, band_weights, window_power
 
 
 def band_rms(data, samplerate, freq_low=20, freq_high=20000):
@@ -32,22 +52,14 @@ def band_rms(data, samplerate, freq_low=20, freq_high=20000):
 
     if freq_low <= 20 and freq_high >= 20000:
         # Full audible range: no filtering needed, plain RMS is exact.
-        return np.sqrt(np.mean(data ** 2, axis=0))
+        return np.sqrt(np.mean(data**2, axis=0))
 
-    window = np.hanning(n)
+    window, band_weights, window_power = _band_plan(n, samplerate, freq_low, freq_high)
     spec = np.fft.rfft(data * window[:, None], axis=0)
-    freqs = np.fft.rfftfreq(n, d=1.0 / samplerate)
-    in_band = (freqs >= freq_low) & (freqs <= freq_high)
 
     # Parseval for rfft: sum(x^2) = (|X_0|^2 + 2*sum(|X_k|^2) + |X_nyq|^2) / n.
-    # The DC and (for even n) Nyquist bins appear once; all others twice.
-    weights = np.full(len(freqs), 2.0)
-    weights[0] = 1.0
-    if n % 2 == 0:
-        weights[-1] = 1.0
-
-    band_energy = ((np.abs(spec) ** 2) * (weights * in_band)[:, None]).sum(axis=0) / n
-    mean_square = band_energy / n / np.mean(window ** 2)
+    band_energy = ((np.abs(spec) ** 2) * band_weights[:, None]).sum(axis=0) / n
+    mean_square = band_energy / n / window_power
     return np.sqrt(mean_square)
 
 

@@ -1,38 +1,47 @@
 import ctypes
+
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QPen
 
 from direction import angle_diff
 
+
 class OverlayRadar(QWidget):
-    positionChanged = pyqtSignal(int, int)   # committed position (persist to disk)
-    positionPreview = pyqtSignal(int, int)   # live drag frames (UI readout only)
+    positionChanged = pyqtSignal(int, int)  # committed position (persist to disk)
+    positionPreview = pyqtSignal(int, int)  # live drag frames (UI readout only)
 
     def __init__(self):
         super().__init__()
-        
+
         self.setWindowTitle("Visual Audio Overlay")
         self.base_window_flags = (
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
         self.drag_enabled = False
         self.drag_start_global = None
         self.drag_start_window = None
         self._apply_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        
+
         self.resize(300, 300)
-        
+
         # Default accent must match the dashboard's default swatch (#9751F2) so the
         # first Start looks the same as the UI shows, even before the user touches
         # the colour picker.
         self.accent_color = QColor("#9751F2")
         self.stroke_width = 6
         self.blips = []
-        
+        self._circle_rect = QRectF()
+        self._base_pen = QPen(QColor(255, 255, 255, 30))
+        self._base_pen.setWidth(2)
+        self._setup_pen = QPen(QColor(255, 255, 255, 120))
+        self._setup_pen.setWidth(1)
+        self._setup_pen.setStyle(Qt.PenStyle.DashLine)
+        self._pen_cache = {}
+
         # Started/stopped with visibility (show/hideEvent) so the 30ms repaint
         # tick doesn't keep running while the overlay is hidden.
         self.decay_timer = QTimer(self)
@@ -54,7 +63,9 @@ class OverlayRadar(QWidget):
         self.drag_enabled = enabled
         self.drag_start_global = None
         self.drag_start_window = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.setCursor(
+            Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.ArrowCursor
+        )
         self._apply_window_flags()
         self.move(pos)
 
@@ -86,19 +97,18 @@ class OverlayRadar(QWidget):
             # 1. Disable rounded corners
             #    DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 33,
-                ctypes.byref(ctypes.c_int(1)),
-                ctypes.sizeof(ctypes.c_int)
+                hwnd, 33, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
             )
 
             # 2. Remove drop shadow / border glow
             class MARGINS(ctypes.Structure):
                 _fields_ = [
-                    ("cxLeftWidth",    ctypes.c_int),
-                    ("cxRightWidth",   ctypes.c_int),
-                    ("cyTopHeight",    ctypes.c_int),
+                    ("cxLeftWidth", ctypes.c_int),
+                    ("cxRightWidth", ctypes.c_int),
+                    ("cyTopHeight", ctypes.c_int),
                     ("cyBottomHeight", ctypes.c_int),
                 ]
+
             ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
                 hwnd, ctypes.byref(MARGINS(0, 0, 0, 0))
             )
@@ -108,7 +118,7 @@ class OverlayRadar(QWidget):
     def set_accent_color(self, hex_color):
         self.accent_color = QColor(hex_color)
         self.update()
-        
+
     def set_stroke_width(self, width):
         self.stroke_width = width
         self.update()
@@ -123,7 +133,11 @@ class OverlayRadar(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event):
-        if not self.drag_enabled or self.drag_start_global is None or self.drag_start_window is None:
+        if (
+            not self.drag_enabled
+            or self.drag_start_global is None
+            or self.drag_start_window is None
+        ):
             return super().mouseMoveEvent(event)
 
         delta = event.globalPosition().toPoint() - self.drag_start_global
@@ -143,34 +157,50 @@ class OverlayRadar(QWidget):
         pos = self.pos()
         self.positionChanged.emit(pos.x(), pos.y())
         event.accept()
-        
+
     def decay_signal(self):
+        if not self.blips:
+            self.decay_timer.stop()
+            return
         decay_rate = 0.04
         active_blips = []
         for blip in self.blips:
-            blip['life'] -= decay_rate
-            if blip['life'] > 0:
+            blip["life"] -= decay_rate
+            if blip["life"] > 0:
                 active_blips.append(blip)
         self.blips = active_blips
         self.update()
-        
+        if not self.blips:
+            self.decay_timer.stop()
+
     def update_audio_data(self, angle, intensity):
         visual_gain = 5.0
         clamped_intensity = min(1.0, intensity * visual_gain)
-        
+
         found = False
         for blip in self.blips:
             # angle_diff wraps at +-180 so a sound directly behind the player
             # (surround: -179 vs +179) refreshes one blip instead of two.
-            if angle_diff(blip['angle'], angle) < 20.0:
-                blip['life'] = max(blip['life'], clamped_intensity)
+            if angle_diff(blip["angle"], angle) < 20.0:
+                blip["life"] = max(blip["life"], clamped_intensity)
                 found = True
                 break
-                
+
         if not found:
-            self.blips.append({'angle': angle, 'life': clamped_intensity})
-            
+            self.blips.append({"angle": angle, "life": clamped_intensity})
+        if not self.decay_timer.isActive():
+            self.decay_timer.start(30)
         self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = self.width()
+        height = self.height()
+        center = QPointF(width / 2, height / 2)
+        radius = min(width, height) / 2 * 0.8
+        self._circle_rect = QRectF(
+            center.x() - radius, center.y() - radius, radius * 2, radius * 2
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -180,43 +210,47 @@ class OverlayRadar(QWidget):
             # Layered windows can be hard to hit-test on fully transparent pixels.
             # A nearly invisible fill makes the whole radar box draggable in setup mode.
             painter.fillRect(self.rect(), QColor(255, 255, 255, 8))
-        
+
         width = self.width()
         height = self.height()
         center = QPointF(width / 2, height / 2)
         radius = min(width, height) / 2 * 0.8
-        
-        base_pen = QPen(QColor(255, 255, 255, 30))
-        base_pen.setWidth(2)
-        painter.setPen(base_pen)
+
+        painter.setPen(self._base_pen)
         painter.drawEllipse(center, radius, radius)
-        
+
         for blip in self.blips:
-            opacity = int(blip['life'] * 255)
+            opacity = int(blip["life"] * 255)
             arc_color = QColor(
                 self.accent_color.red(),
                 self.accent_color.green(),
                 self.accent_color.blue(),
-                opacity
+                opacity,
             )
-            pen = QPen(arc_color)
-            pen.setWidth(self.stroke_width)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            cache_key = (
+                opacity,
+                self.stroke_width,
+                self.accent_color.red(),
+                self.accent_color.green(),
+                self.accent_color.blue(),
+            )
+            pen = self._pen_cache.get(cache_key)
+            if pen is None:
+                pen = QPen(arc_color)
+                pen.setWidth(self.stroke_width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                self._pen_cache[cache_key] = pen
             painter.setPen(pen)
-            
-            center_pyqt_angle = 90 - blip['angle']
+
+            center_pyqt_angle = 90 - blip["angle"]
             span_degrees = 35
             start_deg = center_pyqt_angle - (span_degrees / 2)
-            
+
             start_angle_16 = int(start_deg * 16)
-            span_angle_16  = int(span_degrees * 16)
-            
-            rect = QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
-            painter.drawArc(rect, start_angle_16, span_angle_16)
+            span_angle_16 = int(span_degrees * 16)
+
+            painter.drawArc(self._circle_rect, start_angle_16, span_angle_16)
 
         if self.drag_enabled:
-            setup_pen = QPen(QColor(255, 255, 255, 120))
-            setup_pen.setWidth(1)
-            setup_pen.setStyle(Qt.PenStyle.DashLine)
-            painter.setPen(setup_pen)
+            painter.setPen(self._setup_pen)
             painter.drawEllipse(center, radius + 8, radius + 8)

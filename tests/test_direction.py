@@ -22,10 +22,11 @@ def sine(freq, amp=1.0, n=N, sr=SR):
 
 # ── band_rms ───────────────────────────────────────────────────────────
 
+
 def test_full_range_equals_plain_rms():
     rng = np.random.default_rng(0)
     data = rng.standard_normal((N, 2))
-    expected = np.sqrt(np.mean(data ** 2, axis=0))
+    expected = np.sqrt(np.mean(data**2, axis=0))
     np.testing.assert_allclose(band_rms(data, SR, 20, 20000), expected)
 
 
@@ -60,6 +61,7 @@ def test_per_channel_independence():
 
 # ── stereo_angle ───────────────────────────────────────────────────────
 
+
 def test_stereo_centre_is_zero():
     assert stereo_angle(0.5, 0.5) == pytest.approx(0.0, abs=0.1)
 
@@ -76,6 +78,7 @@ def test_stereo_slight_pan_is_expanded():
 
 
 # ── surround_angle ─────────────────────────────────────────────────────
+
 
 def test_surround_front_is_zero():
     assert surround_angle(1.0, 1.0, 1.0, 0.0, 0.0) == pytest.approx(0.0)
@@ -94,6 +97,7 @@ def test_surround_rear_is_180():
 
 
 # ── angle_diff ─────────────────────────────────────────────────────────
+
 
 def test_angle_diff_simple():
     assert angle_diff(10.0, 30.0) == pytest.approx(20.0)

@@ -34,40 +34,42 @@ sys.coinit_flags = 0  # COINIT_MULTITHREADED
 
 import ctypes
 import threading
-from ctypes import POINTER, byref, c_uint32, c_uint64, c_void_p
-from ctypes import wintypes
+from ctypes import POINTER, byref, c_uint32, c_uint64, c_void_p, wintypes
 
 import numpy as np
-from comtypes import COMMETHOD, COMObject, GUID, HRESULT, IUnknown
+from comtypes import COMMETHOD, GUID, HRESULT, COMObject, IUnknown
+from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
+
 # NB: only IAudioClient is borrowed from pycaw. pycaw's own WAVEFORMATEX is wrong
 # for this use - it types nSamplesPerSec / nAvgBytesPerSec as 16-bit, so a format
 # we *construct* and pass into Initialize gets corrupted (-> E_INVALIDARG). We
 # define a correct 18-byte WAVEFORMATEX below and cast to pycaw's pointer type.
 from pycaw.api.audioclient import IAudioClient
-from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
 
 
 class WAVEFORMATEX(ctypes.Structure):
     """Layout-correct WAVEFORMATEX (18 bytes), packed to match the Win32 header."""
+
     _pack_ = 1
     _fields_ = [
-        ("wFormatTag",      wintypes.WORD),
-        ("nChannels",       wintypes.WORD),
-        ("nSamplesPerSec",  wintypes.DWORD),
+        ("wFormatTag", wintypes.WORD),
+        ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD),
         ("nAvgBytesPerSec", wintypes.DWORD),
-        ("nBlockAlign",     wintypes.WORD),
-        ("wBitsPerSample",  wintypes.WORD),
-        ("cbSize",          wintypes.WORD),
+        ("nBlockAlign", wintypes.WORD),
+        ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
     ]
 
+
 # ── Constants ──────────────────────────────────────────────────────────────
-AUDCLNT_SHAREMODE_SHARED          = 0
-AUDCLNT_STREAMFLAGS_LOOPBACK      = 0x00020000
+AUDCLNT_SHAREMODE_SHARED = 0
+AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000
-AUDCLNT_BUFFERFLAGS_SILENT        = 0x2
+AUDCLNT_BUFFERFLAGS_SILENT = 0x2
 
 WAVE_FORMAT_IEEE_FLOAT = 0x0003
-VT_BLOB                = 0x41   # 65
+VT_BLOB = 0x41  # 65
 
 COINIT_MULTITHREADED = 0x0
 
@@ -81,7 +83,19 @@ VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = "VAD\\Process_Loopback"
 
 _kernel32 = ctypes.windll.kernel32
 _mmdevapi = ctypes.windll.Mmdevapi
-_ole32    = ctypes.windll.ole32
+_ole32 = ctypes.windll.ole32
+
+_kernel32.CreateEventW.restype = wintypes.HANDLE
+_kernel32.CreateEventW.argtypes = [
+    ctypes.c_void_p,
+    wintypes.BOOL,
+    wintypes.BOOL,
+    wintypes.LPCWSTR,
+]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 # comtypes' CoInitializeEx forces an STA apartment, but ActivateAudioInterfaceAsync
 # requires MTA - so we initialize COM ourselves via raw ole32.
@@ -100,14 +114,14 @@ def _co_initialize_mta() -> bool:
 # ── Activation structs (PROPVARIANT-wrapped) ───────────────────────────────
 class AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS(ctypes.Structure):
     _fields_ = [
-        ("TargetProcessId",    wintypes.DWORD),
+        ("TargetProcessId", wintypes.DWORD),
         ("ProcessLoopbackMode", ctypes.c_int),
     ]
 
 
 class AUDIOCLIENT_ACTIVATION_PARAMS(ctypes.Structure):
     _fields_ = [
-        ("ActivationType",       ctypes.c_int),
+        ("ActivationType", ctypes.c_int),
         ("ProcessLoopbackParams", AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS),
     ]
 
@@ -118,12 +132,13 @@ class _BLOB(ctypes.Structure):
 
 class PROPVARIANT(ctypes.Structure):
     """Minimal PROPVARIANT - just enough to carry a VT_BLOB payload."""
+
     _fields_ = [
-        ("vt",         wintypes.WORD),
+        ("vt", wintypes.WORD),
         ("wReserved1", wintypes.WORD),
         ("wReserved2", wintypes.WORD),
         ("wReserved3", wintypes.WORD),
-        ("blob",       _BLOB),
+        ("blob", _BLOB),
     ]
 
 
@@ -131,9 +146,13 @@ class PROPVARIANT(ctypes.Structure):
 class IActivateAudioInterfaceAsyncOperation(IUnknown):
     _iid_ = GUID("{72A22D78-CDE4-431D-B8CC-843A71199B6D}")
     _methods_ = [
-        COMMETHOD([], HRESULT, "GetActivateResult",
-                  (["out"], POINTER(HRESULT), "activateResult"),
-                  (["out"], POINTER(POINTER(IUnknown)), "activatedInterface")),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetActivateResult",
+            (["out"], POINTER(HRESULT), "activateResult"),
+            (["out"], POINTER(POINTER(IUnknown)), "activatedInterface"),
+        ),
     ]
 
 
@@ -143,6 +162,7 @@ class IAgileObject(IUnknown):
     advertises itself as agile, that activation fails with E_ILLEGAL_METHOD_CALL.
     Implementing IAgileObject tells COM the object is free-threaded - no proxy
     needed - which is exactly true for our event-signalling handler."""
+
     _iid_ = GUID("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
     _methods_ = []
 
@@ -150,30 +170,45 @@ class IAgileObject(IUnknown):
 class IActivateAudioInterfaceCompletionHandler(IUnknown):
     _iid_ = GUID("{41D949AB-9862-444A-80F6-C261334DA5EB}")
     _methods_ = [
-        COMMETHOD([], HRESULT, "ActivateCompleted",
-                  (["in"], POINTER(IActivateAudioInterfaceAsyncOperation),
-                   "activateOperation")),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "ActivateCompleted",
+            (
+                ["in"],
+                POINTER(IActivateAudioInterfaceAsyncOperation),
+                "activateOperation",
+            ),
+        ),
     ]
 
 
 class IAudioCaptureClient(IUnknown):
     _iid_ = GUID("{C8ADBD64-E71E-48A0-A4DE-185C395CD317}")
     _methods_ = [
-        COMMETHOD([], HRESULT, "GetBuffer",
-                  (["out"], POINTER(POINTER(wintypes.BYTE)), "ppData"),
-                  (["out"], POINTER(c_uint32), "pNumFramesToRead"),
-                  (["out"], POINTER(wintypes.DWORD), "pdwFlags"),
-                  (["out"], POINTER(c_uint64), "pu64DevicePosition"),
-                  (["out"], POINTER(c_uint64), "pu64QPCPosition")),
-        COMMETHOD([], HRESULT, "ReleaseBuffer",
-                  (["in"], c_uint32, "NumFramesRead")),
-        COMMETHOD([], HRESULT, "GetNextPacketSize",
-                  (["out"], POINTER(c_uint32), "pNumFramesInNextPacket")),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetBuffer",
+            (["out"], POINTER(POINTER(wintypes.BYTE)), "ppData"),
+            (["out"], POINTER(c_uint32), "pNumFramesToRead"),
+            (["out"], POINTER(wintypes.DWORD), "pdwFlags"),
+            (["out"], POINTER(c_uint64), "pu64DevicePosition"),
+            (["out"], POINTER(c_uint64), "pu64QPCPosition"),
+        ),
+        COMMETHOD([], HRESULT, "ReleaseBuffer", (["in"], c_uint32, "NumFramesRead")),
+        COMMETHOD(
+            [],
+            HRESULT,
+            "GetNextPacketSize",
+            (["out"], POINTER(c_uint32), "pNumFramesInNextPacket"),
+        ),
     ]
 
 
 class _CompletionHandler(COMObject):
     """Signals a Python Event when ActivateAudioInterfaceAsync finishes."""
+
     _com_interfaces_ = [IActivateAudioInterfaceCompletionHandler, IAgileObject]
 
     def __init__(self):
@@ -205,6 +240,7 @@ def is_supported() -> bool:
         pass
     # Fall back to GetVersionEx-style check via sys.getwindowsversion.
     import sys
+
     try:
         wv = sys.getwindowsversion()
         return wv.major > 10 or (wv.major == 10 and wv.build >= 20348)
@@ -252,8 +288,9 @@ class ProcessLoopbackCapture:
         params = AUDIOCLIENT_ACTIVATION_PARAMS()
         params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
         params.ProcessLoopbackParams.TargetProcessId = self.pid
-        params.ProcessLoopbackParams.ProcessLoopbackMode = \
+        params.ProcessLoopbackParams.ProcessLoopbackMode = (
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+        )
 
         pv = PROPVARIANT()
         pv.vt = VT_BLOB
@@ -277,18 +314,20 @@ class ProcessLoopbackCapture:
 
         activate_hr, unknown = op.GetActivateResult()
         if activate_hr != 0:
-            raise RuntimeError(f"GetActivateResult HRESULT 0x{activate_hr & 0xFFFFFFFF:08X}")
+            raise RuntimeError(
+                f"GetActivateResult HRESULT 0x{activate_hr & 0xFFFFFFFF:08X}"
+            )
         return unknown.QueryInterface(IAudioClient)
 
     def _init_stream(self, client: IAudioClient):
         wfx = WAVEFORMATEX()
-        wfx.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT
-        wfx.nChannels       = self.channels
-        wfx.nSamplesPerSec  = self.samplerate
-        wfx.wBitsPerSample  = 32
-        wfx.nBlockAlign     = self.channels * 4
+        wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT
+        wfx.nChannels = self.channels
+        wfx.nSamplesPerSec = self.samplerate
+        wfx.wBitsPerSample = 32
+        wfx.nBlockAlign = self.channels * 4
         wfx.nAvgBytesPerSec = self.samplerate * wfx.nBlockAlign
-        wfx.cbSize          = 0
+        wfx.cbSize = 0
         self._block_align = wfx.nBlockAlign
 
         # Event-driven shared mode: both durations MUST be 0. The Initialize
@@ -298,7 +337,8 @@ class ProcessLoopbackCapture:
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            0, 0,
+            0,
+            0,
             wfx_ptr,
             None,
         )
@@ -318,34 +358,29 @@ class ProcessLoopbackCapture:
         Short reads are zero-padded so the caller's timing/RMS stays stable even
         when the target app is silent (no packets arriving).
         """
-        chunks = []
+        data = np.zeros((numframes, self.channels), dtype=np.float32)
         have = 0
         if self._leftover is not None:
-            chunks.append(self._leftover)
-            have += len(self._leftover)
-            self._leftover = None
+            take = min(len(self._leftover), numframes)
+            data[:take] = self._leftover[:take]
+            have = take
+            if take < len(self._leftover):
+                self._leftover = self._leftover[take:]
+            else:
+                self._leftover = None
 
         while have < numframes and self._started:
-            # Wait up to 200ms for the next packet; loop bails on silence.
-            _kernel32.WaitForSingleObject(self._event, 200)
+            # Keep shutdown responsive even when the target is silent.
+            _kernel32.WaitForSingleObject(self._event, 50)
             drained = self._drain_packets()
             if drained is not None:
-                chunks.append(drained)
-                have += len(drained)
+                take = min(len(drained), numframes - have)
+                data[have : have + take] = drained[:take]
+                have += take
+                if take < len(drained):
+                    self._leftover = drained[take:].copy()
             else:
-                break  # silent / no data this window - stop waiting, pad below
-
-        if chunks:
-            data = np.concatenate(chunks, axis=0)
-        else:
-            data = np.zeros((0, self.channels), dtype=np.float32)
-
-        if len(data) > numframes:
-            self._leftover = data[numframes:]
-            data = data[:numframes]
-        elif len(data) < numframes:
-            pad = np.zeros((numframes - len(data), self.channels), dtype=np.float32)
-            data = np.concatenate([data, pad], axis=0)
+                break  # remaining rows are already zero-filled
         return data
 
     def _drain_packets(self) -> np.ndarray | None:
@@ -358,9 +393,11 @@ class ProcessLoopbackCapture:
                     arr = np.zeros((nframes, self.channels), dtype=np.float32)
                 else:
                     fptr = ctypes.cast(data_ptr, POINTER(ctypes.c_float))
-                    arr = np.ctypeslib.as_array(
-                        fptr, shape=(nframes * self.channels,)
-                    ).reshape(nframes, self.channels).copy()
+                    arr = (
+                        np.ctypeslib.as_array(fptr, shape=(nframes * self.channels,))
+                        .reshape(nframes, self.channels)
+                        .copy()
+                    )
                 out.append(arr)
             self._capture.ReleaseBuffer(nframes)
             pkt = self._capture.GetNextPacketSize()
@@ -402,16 +439,17 @@ def _sessions_all_render_devices():
     sessions from each so the app appears regardless of which output it plays to.
     """
     import comtypes
-    from pycaw.utils import AudioSession
+    from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
     from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
-    from pycaw.api.audiopolicy import IAudioSessionManager2, IAudioSessionControl2
-    from pycaw.constants import CLSID_MMDeviceEnumerator, EDataFlow, DEVICE_STATE
+    from pycaw.constants import DEVICE_STATE, CLSID_MMDeviceEnumerator, EDataFlow
+    from pycaw.utils import AudioSession
 
     enumerator = comtypes.CoCreateInstance(
-        CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
-        comtypes.CLSCTX_INPROC_SERVER)
+        CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER
+    )
     devices = enumerator.EnumAudioEndpoints(
-        EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
+        EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value
+    )
 
     for i in range(devices.GetCount()):
         dev = devices.Item(i)
@@ -454,6 +492,7 @@ def list_audio_programs() -> list[dict]:
         # scan fails for any reason, so the dropdown never goes empty.
         try:
             from pycaw.utils import AudioUtilities
+
             sessions = AudioUtilities.GetAllSessions()
         except Exception:
             return []
@@ -474,8 +513,10 @@ def list_audio_programs() -> list[dict]:
         # and the same app appearing on more than one endpoint).
         found.setdefault(friendly, getattr(s, "ProcessId", proc.pid))
 
-    return [{"name": k, "pid": v}
-            for k, v in sorted(found.items(), key=lambda kv: kv[0].lower())]
+    return [
+        {"name": k, "pid": v}
+        for k, v in sorted(found.items(), key=lambda kv: kv[0].lower())
+    ]
 
 
 def resolve_pid(program_name: str) -> int | None:

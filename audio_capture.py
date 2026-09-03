@@ -1,26 +1,51 @@
+import multiprocessing as mp
+
 import numpy as np
-import soundcard as sc
 from PyQt6.QtCore import QThread, pyqtSignal
-import time
 
 from direction import band_rms, stereo_angle, surround_angle
+
+# Keep the capture cadence in one place. 960 frames at 48 kHz gives the radar a
+# roughly 20 ms analysis window without changing the capture/DSP threading model.
+AUDIO_BLOCK_FRAMES = 960
+
 
 class AudioCaptureThread(QThread):
     audio_data_signal = pyqtSignal(float, float)
     device_info_signal = pyqtSignal(str, int)
+    # Emitted only after the capture source has been opened and a first block
+    # has been read.  The GUI uses this to end the asynchronous Start phase.
+    ready_signal = pyqtSignal()
+    # User-facing terminal failure; low-level details stay in worker stderr.
+    error_signal = pyqtSignal(str)
     # Human-readable capture problems (device gone, no loopback, fallbacks).
     # The app forwards these to the dashboard status line so failures are
     # visible to the user, not just printed to a console nobody sees.
     status_signal = pyqtSignal(str)
 
-    def __init__(self, sensitivity=0.005, gain=1.0, freq_low=20, freq_high=20000, max_amplitude=1.0,
-                 target_pid=None, target_name=None):
+    def __init__(
+        self,
+        sensitivity=0.005,
+        gain=1.0,
+        freq_low=20,
+        freq_high=20000,
+        max_amplitude=1.0,
+        target_pid=None,
+        target_name=None,
+        mono_enabled=False,
+        mono_device=None,
+        _manager=True,
+        shared_params=None,
+    ):
         super().__init__()
+        self._manager = _manager
         self.sensitivity = sensitivity
         self.gain = gain
         self.freq_low = freq_low
         self.freq_high = freq_high
-        self.max_amplitude = max_amplitude  # ignore sounds louder than this (1.0 = no limit)
+        self.max_amplitude = (
+            max_amplitude  # ignore sounds louder than this (1.0 = no limit)
+        )
         self.running = True
         self.samplerate = 48000
         # When target_pid is set, capture only that program (and its children)
@@ -30,9 +55,14 @@ class AudioCaptureThread(QThread):
         # Mono output: when enabled, the raw (unfiltered) captured audio is also
         # summed to mono and played to `mono_device` for single-sided listeners.
         # Read at thread start (like target); toggle via the app before Start.
-        self.mono_enabled = False
-        self.mono_device = None
+        self.mono_enabled = bool(mono_enabled)
+        self.mono_device = mono_device or None
         self._mono = None
+        self._process = None
+        self._recv_conn = None
+        self._shared_params = shared_params or mp.get_context("spawn").Array(
+            "d", [sensitivity, gain, freq_low, freq_high, max_amplitude]
+        )
 
     def set_target(self, pid, name=None):
         """Choose the capture source. Only takes effect before the thread starts."""
@@ -48,18 +78,32 @@ class AudioCaptureThread(QThread):
 
     def set_sensitivity(self, sensitivity):
         self.sensitivity = sensitivity
-    
+        self._shared_params[0] = sensitivity
+
     def set_gain(self, gain):
         self.gain = gain
-    
+        self._shared_params[1] = gain
+
     def set_freq_range(self, low, high):
         self.freq_low = low
         self.freq_high = high
-    
+        self._shared_params[2] = low
+        self._shared_params[3] = high
+
     def set_max_amplitude(self, max_amp):
         self.max_amplitude = max_amp
+        self._shared_params[4] = max_amp
+
+    def _user_failure_message(self):
+        label = self.target_name or (
+            f"PID {self.target_pid}" if self.target_pid else "system audio"
+        )
+        return f"Capture of {label} stopped unexpectedly - restart the radar"
 
     def run(self):
+        if self._manager:
+            self._run_manager()
+            return
         # Per-app capture takes the process-loopback path; otherwise capture the
         # whole system mix the way we always have.
         self._start_mono()
@@ -71,14 +115,87 @@ class AudioCaptureThread(QThread):
         finally:
             self._stop_mono()
 
+    def _run_manager(self):
+        config = {
+            "sensitivity": self.sensitivity,
+            "gain": self.gain,
+            "freq_low": self.freq_low,
+            "freq_high": self.freq_high,
+            "max_amplitude": self.max_amplitude,
+            "target_pid": self.target_pid,
+            "target_name": self.target_name,
+            "mono_enabled": self.mono_enabled,
+            "mono_device": self.mono_device,
+            "shared_params": self._shared_params,
+        }
+        ctx = mp.get_context("spawn")
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_capture_worker_entry, args=(send_conn, config), daemon=True
+        )
+        self._process = proc
+        self._recv_conn = recv_conn
+        try:
+            proc.start()
+        except Exception as exc:
+            print(f"Audio helper start failed: {exc}")
+            self.error_signal.emit(self._user_failure_message())
+            recv_conn.close()
+            send_conn.close()
+            self._process = None
+            self._recv_conn = None
+            return
+        send_conn.close()
+        received_error = False
+        received_ready = False
+        try:
+            while self.running:
+                if recv_conn.poll(0.1):
+                    message = recv_conn.recv()
+                    kind, *payload = message
+                    if kind == "audio":
+                        self.audio_data_signal.emit(
+                            float(payload[0]), float(payload[1])
+                        )
+                    elif kind == "device":
+                        self.device_info_signal.emit(str(payload[0]), int(payload[1]))
+                    elif kind == "status":
+                        self.status_signal.emit(str(payload[0]))
+                    elif kind == "error":
+                        received_error = True
+                        self.error_signal.emit(str(payload[0]))
+                    elif kind == "ready":
+                        received_ready = True
+                        self.ready_signal.emit()
+                    elif kind == "done":
+                        break
+                elif not proc.is_alive():
+                    break
+        except (EOFError, OSError):
+            pass
+        finally:
+            if self.running and not received_ready and not received_error:
+                label = self.target_name or "system audio"
+                self.error_signal.emit(
+                    f"Capture of {label} stopped unexpectedly - restart the radar"
+                )
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=1.0)
+            recv_conn.close()
+            self._process = None
+            self._recv_conn = None
+
     # ── Mono down-mix output ───────────────────────────────────────────
     def _start_mono(self):
         if not self.mono_enabled:
             return
         try:
             from mono_output import MonoMixThread
-            self._mono = MonoMixThread(device_name=self.mono_device,
-                                       samplerate=self.samplerate)
+
+            self._mono = MonoMixThread(
+                device_name=self.mono_device, samplerate=self.samplerate
+            )
             self._mono.failed.connect(lambda msg: print(f"Mono output error: {msg}"))
             self._mono.start()
             print(f"Mono output on -> {self.mono_device or 'default device'}")
@@ -101,51 +218,61 @@ class AudioCaptureThread(QThread):
             self._mono = None
 
     def _run_process_loopback(self):
-        """Capture a single program's audio. Falls back to system audio on failure."""
+        """Capture only the selected program; never fall back to system audio."""
         try:
             from process_loopback import ProcessLoopbackCapture
         except Exception as e:
-            print(f"Process loopback unavailable ({e}); using system audio.")
-            self.status_signal.emit("Per-app capture unavailable - using system audio")
-            self._run_system_loopback()
+            message = self._user_failure_message()
+            print(f"Process loopback unavailable ({e})")
+            self.error_signal.emit(message)
             return
 
-        cap = ProcessLoopbackCapture(self.target_pid, samplerate=self.samplerate, channels=2)
+        cap = ProcessLoopbackCapture(
+            self.target_pid, samplerate=self.samplerate, channels=2
+        )
         try:
             cap.start()
         except Exception as e:
-            print(f"Process loopback failed ({e}); using system audio.")
-            self.status_signal.emit("Per-app capture failed - using system audio")
-            self._run_system_loopback()
+            message = self._user_failure_message()
+            print(f"Process loopback failed ({e})")
+            self.error_signal.emit(message)
             return
 
         label = self.target_name or f"PID {self.target_pid}"
         print(f"Capturing app audio: {label} (per-app, Stereo L/R)")
         self.device_info_signal.emit(f"{label} (per-app)", 2)
         try:
+            first_data = cap.read(AUDIO_BLOCK_FRAMES)
+            self.ready_signal.emit()
+            self._feed_mono(first_data)
+            self._process_chunk(first_data, use_surround=False)
             while self.running:
-                data = cap.read(2400)
+                data = cap.read(AUDIO_BLOCK_FRAMES)
                 self._feed_mono(data)
                 self._process_chunk(data, use_surround=False)
         except Exception as e:
             print(f"Process loopback capture error: {e}")
             if self.running:
-                self.status_signal.emit(
-                    f"Capture of {label} stopped unexpectedly - restart the radar")
+                message = self._user_failure_message()
+                self.error_signal.emit(message)
         finally:
             cap.close()
 
     def _run_system_loopback(self):
         try:
+            # Import soundcard only inside the isolated worker.  Importing it in
+            # the GUI process initializes COM as MTA before Qt can OleInitialize.
+            import soundcard as sc
+
             mics = sc.all_microphones(include_loopback=True)
             loopbacks = [m for m in mics if m.isloopback]
-            
+
             if not loopbacks:
                 print("No loopback device found.")
-                self.status_signal.emit(
-                    "No audio output device found - the radar can't capture anything")
+                message = self._user_failure_message()
+                self.error_signal.emit(message)
                 return
-            
+
             # Pick device by priority
             device = None
             try:
@@ -156,32 +283,34 @@ class AudioCaptureThread(QThread):
                         break
             except:
                 pass
-            
+
             if not device:
                 for lb in loopbacks:
                     if "Microphone" not in lb.name:
                         device = lb
                         break
-            
+
             if not device:
                 device = loopbacks[0]
-            
+
             print(f"Using loopback device: {device.name}")
-            self._capture_loop(device, loopbacks)
+            self._capture_loop(device)
 
         except Exception as e:
             print(f"Error in audio capture: {e}")
             import traceback
+
             traceback.print_exc()
             if self.running:
-                self.status_signal.emit(f"Audio capture error: {e}")
+                message = self._user_failure_message()
+                self.error_signal.emit(message)
 
-    def _capture_loop(self, device, all_loopbacks):
+    def _capture_loop(self, device):
         try:
             with device.recorder(samplerate=self.samplerate) as mic:
-                first_data = mic.record(numframes=2400)
+                first_data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
                 raw_channels = first_data.shape[1]
-                
+
                 use_surround = False
                 if raw_channels >= 6:
                     surround_max = max(
@@ -190,41 +319,33 @@ class AudioCaptureThread(QThread):
                     )
                     if surround_max > 0.0001:
                         use_surround = True
-                
+
                 effective = raw_channels if use_surround else min(raw_channels, 2)
                 mode = "360° Surround" if use_surround else "Stereo L/R"
                 print(f"Channels: {raw_channels} | Mode: {mode}")
                 self.device_info_signal.emit(device.name, effective)
-                
+                self.ready_signal.emit()
+
                 self._feed_mono(first_data)
                 self._process_chunk(first_data, use_surround)
 
                 while self.running:
-                    data = mic.record(numframes=2400)
+                    data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
                     self._feed_mono(data)
                     self._process_chunk(data, use_surround)
-                    
-        except RuntimeError as e:
+
+        except Exception as e:
             print(f"Device '{device.name}' failed: {e}")
             if self.running:
-                self.status_signal.emit(
-                    f"Audio device '{device.name}' failed - trying another output")
-            for lb in all_loopbacks:
-                if lb.name == device.name or "Microphone" in lb.name:
-                    continue
-                try:
-                    time.sleep(0.5)
-                    self._capture_loop(lb, [])
-                    return
-                except Exception:
-                    continue
-            # Fallbacks exhausted (or none to try): tell the user instead of
-            # leaving a radar that silently never blips again.
-            if self.running and all_loopbacks:
-                self.status_signal.emit(
-                    "All audio devices failed - stop and restart the radar")
-    
+                message = self._user_failure_message()
+                self.error_signal.emit(message)
+
     def _process_chunk(self, data, use_surround):
+        self.sensitivity = float(self._shared_params[0])
+        self.gain = float(self._shared_params[1])
+        self.freq_low = int(self._shared_params[2])
+        self.freq_high = int(self._shared_params[3])
+        self.max_amplitude = float(self._shared_params[4])
         # Band-limited per-channel RMS (Hann-windowed FFT + Parseval; the
         # direction math only ever needs levels, never a filtered waveform).
         rms = band_rms(data, self.samplerate, self.freq_low, self.freq_high) * self.gain
@@ -249,6 +370,38 @@ class AudioCaptureThread(QThread):
         if intensity > self.sensitivity and intensity < self.max_amplitude:
             self.audio_data_signal.emit(float(angle_deg), float(intensity))
 
-    def stop(self):
+    def request_stop(self):
+        """Stop the isolated worker without waiting on a driver call."""
         self.running = False
-        self.wait()
+        proc = self._process
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+
+    def stop(self):
+        """Backward-compatible alias for a non-blocking stop request."""
+        self.request_stop()
+
+
+def _capture_worker_entry(send_conn, config):
+    """Run all soundcard/WASAPI work outside the GUI process."""
+    capture = AudioCaptureThread(**config, _manager=False)
+
+    def send(message):
+        try:
+            send_conn.send(message)
+        except (BrokenPipeError, EOFError, OSError):
+            capture.running = False
+
+    capture.audio_data_signal.connect(lambda a, i: send(("audio", a, i)))
+    capture.device_info_signal.connect(lambda n, c: send(("device", n, c)))
+    capture.status_signal.connect(lambda msg: send(("status", msg)))
+    capture.error_signal.connect(lambda msg: send(("error", msg)))
+    capture.ready_signal.connect(lambda: send(("ready",)))
+    try:
+        capture.run()
+    except Exception as exc:
+        print(f"Audio capture worker failed: {exc}")
+        send(("error", capture._user_failure_message()))
+    finally:
+        send(("done",))
+        send_conn.close()

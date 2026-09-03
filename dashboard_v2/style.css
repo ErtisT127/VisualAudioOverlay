@@ -510,7 +510,7 @@ body::before {
     height: 120px;
 }
 
-/* ── Footer: passive support links ───────────────────────────────────
+/* ── Footer version indicator ────────────────────────────────────────
    margin-top:auto pins it to the bottom of the flex column without
    touching the cards. Muted by default, accent on hover - never loud. */
 .footer {
@@ -521,21 +521,6 @@ body::before {
     align-items: center;
     gap: 22px;
     font-size: 13px;
-}
-.footer-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-dim);
-    text-decoration: none;
-    transition: color 0.15s ease;
-}
-.footer-link:hover { color: var(--accent); }
-.footer-link--coffee:hover { color: #ffdd00; }
-.footer-icon {
-    width: 15px;
-    height: 15px;
-    flex: none;
 }
 .footer-version {
     margin-left: auto;

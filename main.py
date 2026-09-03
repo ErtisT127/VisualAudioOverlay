@@ -1,25 +1,56 @@
-import sys
-import json
-import os
+# nuitka-project: --onefile
+# nuitka-project: --enable-plugin=pyqt6
+# nuitka-project: --include-qt-plugins=all
+# nuitka-project: --windows-console-mode=disable
+# nuitka-project: --windows-icon-from-ico=assets/icon.ico
+# nuitka-project: --output-dir=dist/nuitka
+# nuitka-project: --output-filename=VisualAudioOverlay.exe
+# nuitka-project: --include-data-dir=dashboard_v2=dashboard_v2
+# nuitka-project: --include-data-dir=assets=assets
+# nuitka-project: --include-module=audio_capture
+# nuitka-project: --include-module=direction
+# nuitka-project: --include-module=overlay
+# nuitka-project: --include-module=mono_output
+# nuitka-project: --include-module=process_loopback
+# nuitka-project: --include-package=comtypes
+# nuitka-project: --include-package=pycaw
+# nuitka-project: --include-package=soundcard
+# nuitka-project: --include-package=psutil
 
-from PyQt6.QtWidgets import QApplication, QMainWindow
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+import json
+import multiprocessing as mp
+import os
+import sys
+import tempfile
+
+from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal, QUrl, QThread, QTimer
-from PyQt6.QtGui import QColor, QIcon
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QSystemTrayIcon
 
 from audio_capture import AudioCaptureThread
 from overlay import OverlayRadar
 
-# RESOURCE_DIR = where bundled, read-only assets live. When packaged by
-# PyInstaller (onefile), datas are extracted to sys._MEIPASS; in dev it's the
-# script folder. DATA_DIR = a writable location for user data (profiles): next
-# to the .exe when frozen, else the script folder.
-if getattr(sys, "frozen", False):
-    RESOURCE_DIR = sys._MEIPASS
-    DATA_DIR = os.path.dirname(sys.executable)
+# RESOURCE_DIR contains bundled, read-only assets. Nuitka resolves __file__ inside
+# the deployed bundle; user data belongs next to the executable when packaged.
+RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Nuitka onefile executes the Python payload from a temporary extraction
+# directory.  Persisted user data must instead follow the launcher executable.
+_exe_name = os.path.basename(sys.executable).lower()
+IS_PACKAGED = (
+    "__compiled__" in globals()
+    or bool(getattr(sys, "frozen", False))
+    or not _exe_name.startswith(("python", "pypy"))
+)
+if IS_PACKAGED:
+    # Nuitka onefile exposes the launch directory explicitly because the
+    # payload's __file__/sys.executable can point at the temporary extraction.
+    DATA_DIR = os.environ.get("NUITKA_ONEFILE_DIRECTORY") or os.path.dirname(
+        os.path.abspath(sys.executable)
+    )
 else:
-    RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = RESOURCE_DIR
 
 PROFILES_FILE = os.path.join(DATA_DIR, "profiles.json")
@@ -28,29 +59,28 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 # Resolved against RESOURCE_DIR so it works both in dev and inside the
 # packaged .exe.
 DASHBOARD_FILE = os.path.join(RESOURCE_DIR, "dashboard_v2", "index.html")
-print(f"Dashboard: {DASHBOARD_FILE}  (exists: {os.path.exists(DASHBOARD_FILE)})")
+if __name__ == "__main__":
+    print(f"Dashboard: {DASHBOARD_FILE}  (exists: {os.path.exists(DASHBOARD_FILE)})")
 
-# App icon (window/taskbar). Use the PNG, not the .ico: QIcon(".ico") needs Qt's
-# qico imageformat plugin, which PyInstaller does not reliably bundle - when it is
-# missing the .ico loads as an empty icon and the taskbar shows no icon. PNG is
-# handled by Qt core (no plugin), so it works in the packaged .exe. The .ico is
-# still used for the .exe file icon via the PyInstaller spec (independent of this).
+# App icon (window/taskbar). Use the PNG, which Qt core handles without an image
+# format plugin in the packaged executable. Nuitka uses the ICO for the executable
+# file icon during the build.
 APP_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.png")
+TRAY_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
 
 # ── Version + project links ─────────────────────────────────────────────────
 # APP_VERSION must match the GitHub release tag (without the leading "v") for the
 # update check to compare correctly. Bump this for every release you tag.
-APP_VERSION = "0.2.1"
-REPO_URL = "https://github.com/mike-s-zaugg/VisualAudioOverlay"
+APP_VERSION = "0.2.2"
+REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay"
 # Latest-release JSON (no auth needed; 60 req/hr per IP is plenty for one check
 # per launch). Used by the in-app update check to reach users who already have
 # the app installed - we have no telemetry/emails, so this is the only channel.
 REPO_LATEST_RELEASE_API = (
-    "https://api.github.com/repos/mike-s-zaugg/VisualAudioOverlay/releases/latest"
+    "https://api.github.com/repos/ErtisT127/VisualAudioOverlay/releases/latest"
 )
-# Where the footer "Send feedback" link goes: a prefilled new-issue form.
-FEEDBACK_URL = REPO_URL + "/issues/new/choose"
-
+SINGLE_INSTANCE_NAME = "VisualAudioOverlay.SingleInstance"
+_UPDATE_CHECK_STARTED = False
 # Footstep bands rev. 2026-07-02, based on spectral analysis of the actual CS2
 # footstep assets (extracted from pak01_dir.vpk) plus published EQ guidance for
 # the other games. Key findings: footstep energy spans ~150Hz-4kHz (soft/wet
@@ -71,13 +101,14 @@ FEEDBACK_URL = REPO_URL + "/issues/new/choose"
 # them without reintroducing the leak.
 _PRESET_LEVEL_DEFAULTS = {"sensitivity": 0.005, "gain": 1.0}
 SOUND_PRESETS = {
-    name: {**_PRESET_LEVEL_DEFAULTS, **band} for name, band in {
-        "All Sounds":           {"freq_low": 20,  "freq_high": 20000, "max_amp": 1.0},
-        "Footsteps - CS2":      {"freq_low": 150, "freq_high": 4000,  "max_amp": 0.15},
-        "Footsteps - Valorant": {"freq_low": 150, "freq_high": 4000,  "max_amp": 0.12},
-        "Footsteps - Fortnite": {"freq_low": 150, "freq_high": 5000,  "max_amp": 0.18},
-        "Footsteps - General":  {"freq_low": 150, "freq_high": 4000,  "max_amp": 0.15},
-        "Custom":               {"freq_low": 150, "freq_high": 4000,  "max_amp": 1.0},
+    name: {**_PRESET_LEVEL_DEFAULTS, **band}
+    for name, band in {
+        "All Sounds": {"freq_low": 20, "freq_high": 20000, "max_amp": 1.0},
+        "Footsteps - CS2": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
+        "Footsteps - Valorant": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.12},
+        "Footsteps - Fortnite": {"freq_low": 150, "freq_high": 5000, "max_amp": 0.18},
+        "Footsteps - General": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
+        "Custom": {"freq_low": 150, "freq_high": 4000, "max_amp": 1.0},
     }.items()
 }
 
@@ -95,11 +126,55 @@ PROFILE_SLIDER_SCALE = {
 }
 
 
+def _load_json_mapping(path: str) -> dict:
+    """Read a JSON object, returning an empty mapping for missing/bad files."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
+        print(f"Ignoring non-object config file: {path}")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"Config read skipped for {path}: {exc}")
+    return {}
+
+
+def _save_json_mapping(path: str, data: dict) -> bool:
+    """Atomically write a JSON object, keeping a failed write from truncating it."""
+    temporary_path = None
+    try:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        return True
+    except Exception as exc:
+        print(f"Config write skipped for {path}: {exc}")
+        return False
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
 # ── Bridge ─────────────────────────────────────────────────────────────────
 # This object is injected into the JS context as `window.bridge`.
 # JS calls Python methods via:  bridge.start_radar()
 # Python pushes updates to JS via signals, which JS subscribes to:
 #   bridge.statusChanged.connect(function(msg, isActive) { ... })
+
 
 def _parse_version(tag: str):
     """'v0.2.1' or '0.2.1' -> (0, 2, 1). Non-numeric parts become 0 so a weird
@@ -118,7 +193,7 @@ class UpdateCheckThread(QThread):
     newer than APP_VERSION, emits (version, html_url). Fails silently on any
     error (offline, rate-limited, GitHub down) so it is never intrusive."""
 
-    updateFound = pyqtSignal(str, str)   # (latest_version, release_page_url)
+    updateFound = pyqtSignal(str, str)  # (latest_version, release_page_url)
 
     def run(self):
         try:
@@ -139,25 +214,49 @@ class UpdateCheckThread(QThread):
             url = data.get("html_url") or REPO_URL + "/releases/latest"
             if tag and _parse_version(tag) > _parse_version(APP_VERSION):
                 self.updateFound.emit(tag.lstrip("vV"), url)
-        except Exception as e:
+        except Exception:
             # Silent by design - a failed update check must never bother the user.
-            print(f"Update check skipped: {e}")
+            pass
+
+
+class ProgramListThread(QThread):
+    """Enumerate audio sessions off the GUI thread (COM/WASAPI may block)."""
+
+    result = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from process_loopback import list_audio_programs
+
+            names = [p["name"] for p in list_audio_programs()]
+        except Exception as exc:
+            print(f"Program enumeration failed: {exc}")
+            names = []
+        self.result.emit(json.dumps(names))
 
 
 class Bridge(QObject):
     # Signals → pushed to JS
-    statusChanged   = pyqtSignal(str, bool)   # (message, isActive)
-    deviceChanged   = pyqtSignal(str)          # detected device name
-    profilesChanged = pyqtSignal(str)          # full profiles dict as JSON
-    monitorsChanged = pyqtSignal(str)          # list of monitors as JSON
-    presetsChanged  = pyqtSignal(str)          # list of preset names as JSON
-    programsChanged = pyqtSignal(str)          # running audio programs as JSON
-    overlayPositionChanged = pyqtSignal(str)   # overlay position/state as JSON
-    monoStateChanged = pyqtSignal(str)         # mono-output devices + cable state as JSON
-    updateAvailable = pyqtSignal(str, str)     # (latest_version, release_page_url)
-    appearanceChanged = pyqtSignal(str)        # saved overlay accent colour + thickness as JSON
-    selectedPresetChanged = pyqtSignal(str)    # preset/profile name to restore in the dropdown
-    audioSettingsChanged = pyqtSignal(str)     # all five live audio params, so JS moves the sliders
+    statusChanged = pyqtSignal(str, bool)  # (message, isActive)
+    deviceChanged = pyqtSignal(str)  # detected device name
+    profilesChanged = pyqtSignal(str)  # full profiles dict as JSON
+    monitorsChanged = pyqtSignal(str)  # list of monitors as JSON
+    presetsChanged = pyqtSignal(str)  # list of preset names as JSON
+    programsChanged = pyqtSignal(str)  # running audio programs as JSON
+    overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
+    monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
+    updateAvailable = pyqtSignal(str, str)  # (latest_version, release_page_url)
+    appearanceChanged = pyqtSignal(
+        str
+    )  # saved overlay accent colour + thickness as JSON
+    selectedPresetChanged = pyqtSignal(
+        str
+    )  # preset/profile name to restore in the dropdown
+    audioSettingsChanged = pyqtSignal(
+        str
+    )  # all five live audio params, so JS moves the sliders
+    operationBusyChanged = pyqtSignal(bool)  # Start/End lifecycle lock
+    operationStateChanged = pyqtSignal(str)  # idle/starting/stopping
 
     def __init__(self, app: "AudioRadarApp"):
         super().__init__()
@@ -241,18 +340,17 @@ class Bridge(QObject):
         if the installer isn't bundled in this build."""
         self._app.install_vbcable()
 
-    # ── Project links / about ─────────────────────────────────────────
+    # ── Version / external links ──────────────────────────────────────
     @pyqtSlot(result=str)
     def get_app_version(self) -> str:
         return APP_VERSION
 
     @pyqtSlot(str)
     def open_url(self, url: str):
-        """Open an external link (footer: star/feedback/contribute, or the update
-        banner) in the user's real browser - not inside this QWebEngine window.
-        Guarded to https:// only so JS can't be coaxed into launching anything."""
+        """Open an https link in the user's real browser, not inside the webview."""
         if isinstance(url, str) and url.startswith("https://"):
             import webbrowser
+
             webbrowser.open(url)
 
     @pyqtSlot(bool)
@@ -331,8 +429,14 @@ class Bridge(QObject):
         """
         # Monitors
         screens = QApplication.screens()
-        monitors = [{"idx": i, "name": s.name(), "resolution": f"{s.geometry().width()}×{s.geometry().height()}"}
-                    for i, s in enumerate(screens)]
+        monitors = [
+            {
+                "idx": i,
+                "name": s.name(),
+                "resolution": f"{s.geometry().width()}×{s.geometry().height()}",
+            }
+            for i, s in enumerate(screens)
+        ]
         self.monitorsChanged.emit(json.dumps(monitors))
 
         # Preset/profile selection saved from the last session. Emitted BEFORE the
@@ -367,17 +471,34 @@ class Bridge(QObject):
 
 # ── Main Application ────────────────────────────────────────────────────────
 
+
 class AudioRadarApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, single_instance_server=None):
         super().__init__()
         self.setWindowTitle("Visual Audio Overlay")
         if os.path.exists(APP_ICON):
             self.setWindowIcon(QIcon(APP_ICON))
         self.resize(1100, 720)
+        self._closing_for_exit = False
+        self._exit_finalized = False
+        self.radar_operation_state = "idle"
+        self._capture_watchdog = QTimer(self)
+        self._capture_watchdog.setSingleShot(True)
+        self._capture_watchdog.setInterval(10000)
+        self._capture_watchdog.timeout.connect(self._on_capture_timeout)
+        self._program_list_thread = None
+        self._pending_capture_restart = False
+        self._capture_terminal_error = None
+        self._single_instance_server = single_instance_server
+        if self._single_instance_server is not None:
+            self._single_instance_server.newConnection.connect(
+                self._on_single_instance_connection
+            )
+        self._setup_tray_icon()
 
         self.invert_direction = False
         self.selected_monitor = 0
-        self.selected_program = None   # None = whole-system audio; else a program name
+        self.selected_program = None  # None = whole-system audio; else a program name
         self.profiles = self._load_profiles()
         self.settings = self._load_settings()
         self.radar_active = False
@@ -389,11 +510,11 @@ class AudioRadarApp(QMainWindow):
         # revert to "all frequencies" after the first stop/start. Defaults match
         # the dashboard's initial slider positions.
         self.audio_settings = {
-            "sensitivity": 0.005,   # sens slider 50 / 10000
-            "gain": 1.0,            # gain slider 10 / 10
-            "freq_low": 150,        # freq slider default (matches SOUND_PRESETS)
+            "sensitivity": 0.005,  # sens slider 50 / 10000
+            "gain": 1.0,  # gain slider 10 / 10
+            "freq_low": 150,  # freq slider default (matches SOUND_PRESETS)
             "freq_high": 4000,
-            "max_amp": 1.0,         # max-amp slider 100 / 100
+            "max_amp": 1.0,  # max-amp slider 100 / 100
         }
         # ...and restored from settings.json on top of those defaults, so a tuned
         # slider survives a restart. Without this the only thing that came back
@@ -418,7 +539,12 @@ class AudioRadarApp(QMainWindow):
         # audio_settings above, because re-applying the entry would clobber
         # anything the user changed after picking it. Defaults to "All Sounds",
         # which is what an unrestored dropdown already displays.
-        self.selected_preset = self.settings.get("selected_preset") or "All Sounds"
+        saved_preset = self.settings.get("selected_preset")
+        self.selected_preset = (
+            saved_preset
+            if isinstance(saved_preset, str) and saved_preset
+            else "All Sounds"
+        )
 
         # Mono output (single-sided listeners). Persisted in settings.json so the
         # user's choice survives restarts; applied to the audio thread on Start.
@@ -431,8 +557,14 @@ class AudioRadarApp(QMainWindow):
         # Overlay appearance (accent colour + stroke). Persisted in settings.json so
         # the look survives restarts; applied to the overlay now and pushed to the
         # dashboard via emit_appearance() on load. Default matches the UI swatch.
-        self.accent_color = self.settings.get("accent_color") or "#9751F2"
-        self.stroke_width = int(self.settings.get("stroke_width", 6))
+        saved_color = self.settings.get("accent_color")
+        self.accent_color = (
+            saved_color if isinstance(saved_color, str) and saved_color else "#9751F2"
+        )
+        try:
+            self.stroke_width = int(self.settings.get("stroke_width", 6))
+        except (TypeError, ValueError):
+            self.stroke_width = 6
         self.overlay.set_accent_color(self.accent_color)
         self.overlay.set_stroke_width(self.stroke_width)
 
@@ -461,9 +593,53 @@ class AudioRadarApp(QMainWindow):
         # forwards it to JS, which shows a small dismissible "update available"
         # banner. Silent on any failure - never blocks or nags. Kept as an
         # attribute so the QThread isn't garbage-collected mid-run.
-        self.update_thread = UpdateCheckThread()
-        self.update_thread.updateFound.connect(self.bridge.updateAvailable)
-        self.update_thread.start()
+        global _UPDATE_CHECK_STARTED
+        self.update_thread = None
+        if not _UPDATE_CHECK_STARTED:
+            _UPDATE_CHECK_STARTED = True
+            self.update_thread = UpdateCheckThread()
+            self.update_thread.updateFound.connect(self.bridge.updateAvailable)
+            self.update_thread.start()
+
+    def _setup_tray_icon(self):
+        icon_path = TRAY_ICON if os.path.exists(TRAY_ICON) else APP_ICON
+        self.tray_icon = QSystemTrayIcon(QIcon(icon_path), self)
+        self.tray_icon.setToolTip("Visual Audio Overlay")
+
+        menu = QMenu(self)
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self._restore_from_tray)
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self._exit_from_tray)
+        menu.addAction(show_action)
+        menu.addAction(exit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_single_instance_connection(self):
+        while self._single_instance_server.hasPendingConnections():
+            socket = self._single_instance_server.nextPendingConnection()
+            if socket is None:
+                continue
+            socket.waitForReadyRead(200)
+            socket.readAll()
+            socket.disconnectFromServer()
+            self._restore_from_tray()
+
+    @pyqtSlot(QSystemTrayIcon.ActivationReason)
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._restore_from_tray()
+
+    def _exit_from_tray(self):
+        self._closing_for_exit = True
+        self.close()
 
     # ── Audio Callbacks ───────────────────────────────────────────────
     def on_audio_data(self, angle: float, intensity: float):
@@ -476,9 +652,15 @@ class AudioRadarApp(QMainWindow):
         self.bridge.deviceChanged.emit(label)
 
     def on_capture_status(self, message: str):
-        """Capture-thread problems (device lost, fallback taken) surfaced on the
-        dashboard status line instead of only the console."""
+        """Non-terminal capture status intended for the UI."""
         self.bridge.statusChanged.emit(message, self.radar_active)
+
+    def _on_capture_error(self, message: str):
+        """Remember terminal capture errors so cleanup cannot overwrite them."""
+        self._capture_terminal_error = message
+        self.radar_active = False
+        self.overlay.hide()
+        self.bridge.statusChanged.emit(message, False)
 
     def _new_audio_thread(self):
         """QThreads aren't restartable, so a fresh (idle) thread is created here
@@ -487,6 +669,9 @@ class AudioRadarApp(QMainWindow):
         self.audio_thread.audio_data_signal.connect(self.on_audio_data)
         self.audio_thread.device_info_signal.connect(self.on_device_info)
         self.audio_thread.status_signal.connect(self.on_capture_status)
+        self.audio_thread.error_signal.connect(self._on_capture_error)
+        self.audio_thread.ready_signal.connect(self._on_capture_ready)
+        self.audio_thread.finished.connect(self._on_capture_finished)
 
     def on_overlay_position_changed(self, x: int, y: int):
         self.settings["overlay_position"] = {"x": int(x), "y": int(y)}
@@ -523,17 +708,31 @@ class AudioRadarApp(QMainWindow):
         self._restart_capture_if_active()
 
     def list_programs(self):
-        """Running programs with an audio session. Safe to call on the GUI thread."""
+        """Running programs with an audio session (legacy synchronous helper)."""
         try:
             from process_loopback import list_audio_programs
+
             return list_audio_programs()
         except Exception as e:
             print(f"Program enumeration failed: {e}")
             return []
 
     def emit_programs(self):
-        names = [p["name"] for p in self.list_programs()]
-        self.bridge.programsChanged.emit(json.dumps(names))
+        if (
+            self._program_list_thread is not None
+            and self._program_list_thread.isRunning()
+        ):
+            return
+        self._program_list_thread = ProgramListThread(self)
+        self._program_list_thread.result.connect(self.bridge.programsChanged)
+        self._program_list_thread.finished.connect(self._on_program_list_finished)
+        self._program_list_thread.start()
+
+    def _on_program_list_finished(self):
+        thread = self._program_list_thread
+        self._program_list_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
     # ── Overlay appearance (accent colour + stroke) ───────────────────
     def set_accent_color(self, hex_color: str):
@@ -551,10 +750,14 @@ class AudioRadarApp(QMainWindow):
     def emit_appearance(self):
         """Push the saved accent colour + thickness to the dashboard on load so the
         picker/slider/preview match the overlay (and what was saved last session)."""
-        self.bridge.appearanceChanged.emit(json.dumps({
-            "color": self.accent_color,
-            "thickness": self.stroke_width,
-        }))
+        self.bridge.appearanceChanged.emit(
+            json.dumps(
+                {
+                    "color": self.accent_color,
+                    "thickness": self.stroke_width,
+                }
+            )
+        )
 
     # ── Mono output (single-sided listeners) ──────────────────────────
     def set_mono_enabled(self, enabled: bool):
@@ -581,8 +784,12 @@ class AudioRadarApp(QMainWindow):
         """Push the playback-device list + VB-CABLE detection + current selection
         to the UI so it can render the mono setup card."""
         try:
-            from mono_output import (list_output_devices, default_output_name,
-                                     detect_virtual_cable)
+            from mono_output import (
+                default_output_name,
+                detect_virtual_cable,
+                list_output_devices,
+            )
+
             devices = list_output_devices()
             default = default_output_name()
             cable = detect_virtual_cable()
@@ -593,7 +800,7 @@ class AudioRadarApp(QMainWindow):
         state = {
             "devices": devices,
             "default": default,
-            "cable": cable,            # None until VB-CABLE is installed
+            "cable": cable,  # None until VB-CABLE is installed
             "enabled": self.mono_enabled,
             "selected": self.mono_device,
         }
@@ -604,15 +811,17 @@ class AudioRadarApp(QMainWindow):
         doesn't bundle it, open the official download page instead. The installer
         shows its own UI on purpose (donationware terms + trust for the
         anti-cheat-wary audience)."""
-        installer = os.path.join(RESOURCE_DIR, "vendor", "VBCABLE",
-                                 "VBCABLE_Setup_x64.exe")
+        installer = os.path.join(
+            RESOURCE_DIR, "vendor", "VBCABLE", "VBCABLE_Setup_x64.exe"
+        )
         if os.path.exists(installer):
             try:
+                import ctypes
                 import shutil
                 import tempfile
-                import ctypes
-                # Copy out of the (onefile) bundle first: _MEIPASS is wiped when
-                # this app exits, which could break the installer mid-run.
+
+                # Copy out of a temporary onefile bundle first so the installer
+                # remains available after the app exits.
                 tmp = os.path.join(tempfile.gettempdir(), "VBCABLE_Setup_x64.exe")
                 shutil.copyfile(installer, tmp)
                 ctypes.windll.shell32.ShellExecuteW(None, "runas", tmp, None, None, 1)
@@ -620,6 +829,7 @@ class AudioRadarApp(QMainWindow):
             except Exception as e:
                 print(f"VB-CABLE launch failed: {e}")
         import webbrowser
+
         webbrowser.open("https://vb-audio.com/Cable/")
 
     def _resolve_target(self):
@@ -629,6 +839,7 @@ class AudioRadarApp(QMainWindow):
             return None, None
         try:
             from process_loopback import resolve_pid
+
             pid = resolve_pid(self.selected_program)
         except Exception:
             pid = None
@@ -655,8 +866,13 @@ class AudioRadarApp(QMainWindow):
         saved = self.settings.get("audio_settings")
         if not isinstance(saved, dict):
             return
-        for key, cast in (("sensitivity", float), ("gain", float),
-                          ("freq_low", int), ("freq_high", int), ("max_amp", float)):
+        for key, cast in (
+            ("sensitivity", float),
+            ("gain", float),
+            ("freq_low", int),
+            ("freq_high", int),
+            ("max_amp", float),
+        ):
             if key in saved:
                 try:
                     self.audio_settings[key] = cast(saved[key])
@@ -693,18 +909,22 @@ class AudioRadarApp(QMainWindow):
         prof = self.profiles.get(self.selected_preset)
         if prof is None:
             return
-        updated = {k: round(self.audio_settings[k] * scale)
-                   for k, scale in PROFILE_SLIDER_SCALE.items()}
-        updated.update({
-            "program": self.selected_program or "all",
-            "monitor": self.selected_monitor,
-            "mono_enabled": self.mono_enabled,
-            "mono_device": self.mono_device or "",
-            "accent_color": self.accent_color,
-            "thickness": self.stroke_width,
-        })
+        updated = {
+            k: round(self.audio_settings[k] * scale)
+            for k, scale in PROFILE_SLIDER_SCALE.items()
+        }
+        updated.update(
+            {
+                "program": self.selected_program or "all",
+                "monitor": self.selected_monitor,
+                "mono_enabled": self.mono_enabled,
+                "mono_device": self.mono_device or "",
+                "accent_color": self.accent_color,
+                "thickness": self.stroke_width,
+            }
+        )
         if all(prof.get(k) == v for k, v in updated.items()):
-            return                      # nothing moved: no disk write, no rebuild
+            return  # nothing moved: no disk write, no rebuild
         prof.update(updated)
         self._save_profiles()
         # The dashboard caches profiles to feed applyProfileValues, so it has to
@@ -763,25 +983,88 @@ class AudioRadarApp(QMainWindow):
         # Resolve the capture target fresh (PIDs change between launches).
         pid, name = self._resolve_target()
         self.audio_thread.set_target(pid, name)
+        self._capture_label = (
+            name if pid is not None else (self.selected_program or "system audio")
+        )
         self.audio_thread.set_mono(self.mono_enabled, self.mono_device)
         self._apply_audio_settings_to_thread()
 
         if not self.audio_thread.isRunning():
             self.audio_thread.start()
 
-        if self.selected_program and pid is None:
+        # The UI remains in a loading state until the worker emits ready_signal.
+        self.bridge.statusChanged.emit("Starting audio capture...", False)
+
+    def _set_operation_state(self, state):
+        self.radar_operation_state = state
+        self.bridge.operationBusyChanged.emit(state != "idle")
+        self.bridge.operationStateChanged.emit(state)
+
+    def _on_capture_ready(self):
+        if self.radar_operation_state != "starting":
+            return
+        self._capture_watchdog.stop()
+        self._capture_terminal_error = None
+        self.radar_active = True
+        self._set_operation_state("idle")
+        if self.selected_program and self._capture_label != "system audio":
             self.bridge.statusChanged.emit(
-                f"'{self.selected_program}' has no audio - using system audio", True)
-        elif pid is not None:
-            self.bridge.statusChanged.emit(f"Radar active - capturing {name}", True)
+                f"Radar active - capturing {self._capture_label}", True
+            )
         else:
             self.bridge.statusChanged.emit("Radar is active", True)
 
+    def _on_capture_timeout(self):
+        if self.radar_operation_state != "starting":
+            return
+        label = (
+            getattr(self, "_capture_label", None)
+            or self.selected_program
+            or "system audio"
+        )
+        self._capture_terminal_error = (
+            f"Capture of {label} stopped unexpectedly - restart the radar"
+        )
+        print(self._capture_terminal_error)
+        self.radar_active = False
+        self.overlay.hide()
+        self._set_operation_state("stopping")
+        self.audio_thread.request_stop()
+
+    def _on_capture_finished(self):
+        if self.radar_operation_state not in ("starting", "stopping"):
+            return
+        self._capture_watchdog.stop()
+        self.radar_active = False
+        self.overlay.hide()
+        if self._closing_for_exit:
+            self._finalize_exit()
+            return
+        if self._pending_capture_restart:
+            self._pending_capture_restart = False
+            self._capture_terminal_error = None
+            self._new_audio_thread()
+            self._set_operation_state("starting")
+            self._start_capture_thread()
+            self._capture_watchdog.start()
+            return
+        self._new_audio_thread()
+        self._set_operation_state("idle")
+        message = self._capture_terminal_error or "Radar stopped"
+        self._capture_terminal_error = None
+        self.bridge.statusChanged.emit(message, False)
+        self.emit_overlay_position()
+
     def start_radar(self):
-        self.radar_active = True
+        if self.radar_operation_state != "idle":
+            return
+        self._set_operation_state("starting")
+        self._capture_terminal_error = None
+        self.radar_active = False
         self.overlay.show()
         self._place_overlay_for_start()
         self._start_capture_thread()
+        self._capture_watchdog.start()
         # Refresh the program list so newly launched apps show up next time.
         self.emit_programs()
 
@@ -791,28 +1074,26 @@ class AudioRadarApp(QMainWindow):
         overlay stays up; only the capture source blips out for a moment."""
         if not self.radar_active:
             return
-        self.audio_thread.stop()
-        self._new_audio_thread()
-        self._start_capture_thread()
+        self.audio_thread.request_stop()
+        self._set_operation_state("stopping")
+        self._pending_capture_restart = True
 
     def stop_radar(self):
+        if self.radar_operation_state != "idle":
+            return
         self.radar_active = False
         self.overlay.set_drag_enabled(False)
         self.overlay.hide()
-        self.audio_thread.stop()
-
-        # Create a fresh thread ready for next start
-        self._new_audio_thread()
-
-        self.bridge.statusChanged.emit("Radar stopped", False)
-        self.emit_overlay_position()
+        self._set_operation_state("stopping")
+        self._capture_watchdog.stop()
+        self.audio_thread.request_stop()
 
     def _selected_monitor_center_position(self):
         screens = QApplication.screens()
         idx = self.selected_monitor if self.selected_monitor < len(screens) else 0
         geo = screens[idx].geometry()
         return (
-            geo.x() + (geo.width()  - self.overlay.width())  // 2,
+            geo.x() + (geo.width() - self.overlay.width()) // 2,
             geo.y() + (geo.height() - self.overlay.height()) // 2,
         )
 
@@ -878,43 +1159,79 @@ class AudioRadarApp(QMainWindow):
 
     # ── Profiles ──────────────────────────────────────────────────────
     def _load_profiles(self) -> dict:
-        if os.path.exists(PROFILES_FILE):
-            try:
-                with open(PROFILES_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
+        profiles = _load_json_mapping(PROFILES_FILE)
+        if not os.path.exists(PROFILES_FILE):
+            _save_json_mapping(PROFILES_FILE, profiles)
+        return profiles
 
     def _save_profiles(self):
-        with open(PROFILES_FILE, "w") as f:
-            json.dump(self.profiles, f, indent=2)
+        _save_json_mapping(PROFILES_FILE, self.profiles)
 
     def _load_settings(self) -> dict:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
+        settings = _load_json_mapping(SETTINGS_FILE)
+        if not os.path.exists(SETTINGS_FILE):
+            _save_json_mapping(SETTINGS_FILE, settings)
+        return settings
 
     def _save_settings(self):
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(self.settings, f, indent=2)
+        _save_json_mapping(SETTINGS_FILE, self.settings)
 
     # ── Lifecycle ─────────────────────────────────────────────────────
     def closeEvent(self, event):
+        if not self._closing_for_exit:
+            self._flush_pending_saves()
+            self.hide()
+            event.ignore()
+            return
+
         self._flush_pending_saves()
-        try:
-            self.stop_radar()
-        except Exception:
-            pass
+        event.ignore()
+        self.radar_active = False
+        self.overlay.hide()
+        self._capture_watchdog.stop()
+        if self.audio_thread.isRunning():
+            self._set_operation_state("stopping")
+            self.audio_thread.request_stop()
+        else:
+            self._finalize_exit()
+
+    def _finalize_exit(self):
+        if self._exit_finalized:
+            return
+        self._exit_finalized = True
+        if self.tray_icon:
+            self.tray_icon.hide()
+        if self._single_instance_server is not None:
+            self._single_instance_server.close()
         self.overlay.close()
-        event.accept()
+        app = QApplication.instance()
+        if app:
+            app.quit()
+
+
+def _acquire_single_instance():
+    """Return the listening server for the first process, or None for a client."""
+    probe = QLocalSocket()
+    probe.connectToServer(SINGLE_INSTANCE_NAME)
+    if probe.waitForConnected(300):
+        probe.write(b"restore")
+        probe.flush()
+        probe.waitForBytesWritten(200)
+        probe.disconnectFromServer()
+        return None
+
+    server = QLocalServer()
+    if not server.listen(SINGLE_INSTANCE_NAME):
+        # A crashed process can leave the name behind. Remove only the local
+        # endpoint and retry; an active server would have accepted the probe.
+        QLocalServer.removeServer(SINGLE_INSTANCE_NAME)
+        if not server.listen(SINGLE_INSTANCE_NAME):
+            return None
+    return server
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     # Windows groups taskbar buttons (and picks their icon) by AppUserModelID.
     # Without an explicit ID, a `python main.py` launch shows the generic Python
     # icon in the taskbar even though setWindowIcon is set. Declaring our own ID
@@ -922,6 +1239,7 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         try:
             import ctypes
+
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 "VisualAudioOverlay.App"
             )
@@ -929,8 +1247,11 @@ if __name__ == "__main__":
             pass
 
     app = QApplication(sys.argv)
+    single_instance_server = _acquire_single_instance()
+    if single_instance_server is None:
+        sys.exit(0)
     if os.path.exists(APP_ICON):
         app.setWindowIcon(QIcon(APP_ICON))
-    window = AudioRadarApp()
+    window = AudioRadarApp(single_instance_server)
     window.show()
     sys.exit(app.exec())

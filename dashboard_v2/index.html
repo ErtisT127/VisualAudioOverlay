@@ -250,38 +250,8 @@
         </div>
 
         <!-- ── Footer: passive, non-intrusive support links ─────────────────
-             No popups or nags - just always-there ghost links. Each opens in
-             the real browser via bridge.open_url (not inside this webview). -->
+             The current application version is shown here. -->
         <footer class="footer">
-            <a href="#" class="footer-link" title="Star the project on GitHub"
-                onclick="AR.openRepo(); return false;">
-                <svg class="footer-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path fill="currentColor" d="M12 17.27l-5.18 3.04 1.4-5.96-4.62-4 6.08-.52L12 4l2.32 5.83 6.08.52-4.62 4 1.4 5.96z"/>
-                </svg>
-                <span>Star on GitHub</span>
-            </a>
-            <a href="#" class="footer-link" title="Report a bug or request a feature"
-                onclick="AR.openFeedback(); return false;">
-                <svg class="footer-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path fill="currentColor" d="M4 4h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H8l-4 4V5a1 1 0 0 1 1-1z"/>
-                </svg>
-                <span>Send feedback</span>
-            </a>
-            <a href="#" class="footer-link" title="Contribute / help build it"
-                onclick="AR.openContribute(); return false;">
-                <svg class="footer-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path fill="currentColor" d="M12 21s-7.5-4.6-10-9A5 5 0 0 1 12 6a5 5 0 0 1 10 6c-2.5 4.4-10 9-10 9z"/>
-                </svg>
-                <span>Contribute</span>
-            </a>
-            <a href="#" class="footer-link footer-link--coffee" title="Buy me a coffee (optional)"
-                onclick="AR.openCoffee(); return false;">
-                <svg class="footer-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path fill="currentColor" d="M4 8h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V8zm13 1h2.5a2.5 2.5 0 0 1 0 5H17V9zM6 2.5c.5.6.5 1.2 0 1.8M9.5 2.5c.5.6.5 1.2 0 1.8M13 2.5c.5.6.5 1.2 0 1.8M3 20.5h15"
-                        stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-                <span>Buy me a coffee</span>
-            </a>
             <span class="footer-version" id="footer-version"></span>
         </footer>
 
