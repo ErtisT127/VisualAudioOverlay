@@ -116,7 +116,7 @@ git clone https://github.com/ErtisT127/VisualAudioOverlay.git
 cd VisualAudioOverlay
 uv sync --group dev --group build   # dev = ruff + pytest, build = nuitka
 bash scripts/build_native.sh        # overlay_native.dll via MinGW
-uv run python main.py
+uv run python src/main.py
 ```
 
 The dashboard is plain browser JavaScript with no bundling, so `pnpm install`

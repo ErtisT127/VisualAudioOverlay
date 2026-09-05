@@ -84,7 +84,7 @@ switch ($CCompiler) {
 if (Test-Path -LiteralPath (Join-Path $projectRoot "vendor") -PathType Container) {
     $nuitkaArguments += "--include-data-dir=vendor=vendor"
 }
-$nuitkaArguments += "main.py"
+$nuitkaArguments += "src/main.py"
 
 & $interp -m nuitka @nuitkaArguments
 if ($LASTEXITCODE -ne 0) {

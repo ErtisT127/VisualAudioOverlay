@@ -72,14 +72,20 @@ class NativeOverlay(QObject):
         candidates = []
         if dll_path:
             candidates.append(Path(dll_path))
+        # The DLL is built under native/ at the repository root. Packaged
+        # (Nuitka onefile) runs this module from the extraction root, where
+        # build_nuitka unpacks the DLL to native/overlay_native.dll; in the
+        # repo dev layout this module sits in src/, one level above the
+        # repository root, so probe both this module's directory and its parent.
         module_dir = Path(__file__).resolve().parent
-        candidates.extend(
-            [
-                module_dir / "native" / "overlay_native.dll",
-                module_dir / "native" / "overlay_native" / "build" / "overlay_native.dll",
-                module_dir / "native" / "overlay_native" / "build" / "liboverlay_native.dll",
-            ]
-        )
+        for root in (module_dir, module_dir.parent):
+            candidates.extend(
+                [
+                    root / "native" / "overlay_native.dll",
+                    root / "native" / "overlay_native" / "build" / "overlay_native.dll",
+                    root / "native" / "overlay_native" / "build" / "liboverlay_native.dll",
+                ]
+            )
         for candidate in candidates:
             if candidate.is_file():
                 try:

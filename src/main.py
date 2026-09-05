@@ -196,9 +196,15 @@ from app_logging import (
 from audio_capture import AudioCaptureThread
 from native_overlay import NativeOverlay
 
-# RESOURCE_DIR contains bundled, read-only assets. Nuitka resolves __file__ inside
-# the deployed bundle; user data belongs next to the executable when packaged.
-RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+# RESOURCE_DIR contains bundled, read-only assets. When packaged (Nuitka
+# onefile), __file__ resolves inside the deployed bundle, whose payload root
+# holds the dashboard_v2/ and assets/ dirs the --include-data-dir options
+# unpack. In the dev layout sources live in src/ while those resources stay at
+# the repository root, one level above this module.
+if _IS_PACKAGED_LAUNCH:
+    RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+else:
+    RESOURCE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Nuitka onefile executes the Python payload from a temporary extraction
 # directory.  Persisted user data must instead follow the launcher executable.
 IS_PACKAGED = _IS_PACKAGED_LAUNCH

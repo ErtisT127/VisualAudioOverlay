@@ -1,6 +1,6 @@
 [project]
 name = "visual-audio-overlay"
-version = "0.2.3" # Keep in sync with APP_VERSION in main.py (bump for every release tag)
+version = "0.2.3" # Keep in sync with APP_VERSION in src/main.py (bump for every release tag)
 description = "Windows audio visualizer that renders a DirectComposition radar overlay"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -26,17 +26,14 @@ target-version = "py314"
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "BLE001"]
 
 [tool.ruff.lint.per-file-ignores]
-# main.py's decorative section-banner comments (e.g. "# ── Lifecycle ──") exceed
-# 120 chars; every real code line in it already fits. E501 stays on everywhere else.
-"main.py" = ["E501", "E402"]
-# main.py and process_loopback.py intentionally defer imports: Qt env setup /
-# sys.coinit_flags must run before their respective heavy imports (see the
-# comment above the coinit_flags line in process_loopback.py). E402 is disabled
-# there rather than reordering code that depends on import sequencing.
-"process_loopback.py" = ["E402"]
+# Only src/main.py: its decorative section banners exceed the 120-char limit.
+"src/main.py" = ["E501", "E402"]
+# main.py / process_loopback.py defer heavy imports until after Qt env setup
+# and sys.coinit_flags; E402 keeps that import ordering intact.
+"src/process_loopback.py" = ["E402"]
 
 [tool.pytest.ini_options]
-# `uv run pytest` executes the pytest binary (cwd not auto-added to sys.path),
-# unlike `python -m pytest`; make repo-root imports (direction, audio_capture) work.
-pythonpath = ["."]
+# uv run pytest leaves cwd off sys.path (unlike python -m pytest); src/ holds
+# the flat modules pytest imports by name.
+pythonpath = ["src"]
 

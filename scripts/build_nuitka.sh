@@ -74,7 +74,7 @@ if [[ -d "$project_root/vendor" ]]; then
     nuitka_arguments+=("--include-data-dir=vendor=vendor")
 fi
 
-if ! "${interp[@]}" -m nuitka "${nuitka_arguments[@]}" main.py; then
+if ! "${interp[@]}" -m nuitka "${nuitka_arguments[@]}" src/main.py; then
     printf '%s\n' "Nuitka build failed." >&2
     exit 1
 fi

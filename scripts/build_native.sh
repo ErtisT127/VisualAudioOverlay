@@ -51,10 +51,12 @@ case "$toolchain" in
 esac
 
 log "Configuring native overlay ($generator)..."
+# Keep stdout reserved for the final DLL path (build_nuitka.sh captures it);
+# cmake and the underlying build tool emit progress on stdout by default.
 cmake -S "$native_source" -B "$native_build" -G "$generator" "${compiler_args[@]}" \
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >&2
 log "Building native overlay (Release)..."
-cmake --build "$native_build" --config Release --parallel
+cmake --build "$native_build" --config Release --parallel >&2
 
 native_dll="$(find "$native_build" -type f -iname 'overlay_native.dll' -print -quit)"
 if [[ -z "$native_dll" ]]; then
