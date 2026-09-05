@@ -8,6 +8,7 @@
 # nuitka-project: --include-data-dir=dashboard_v2=dashboard_v2
 # nuitka-project: --include-data-dir=assets=assets
 # nuitka-project: --include-module=audio_capture
+# nuitka-project: --include-module=app_logging
 # nuitka-project: --include-module=direction
 # nuitka-project: --include-module=overlay
 # nuitka-project: --include-module=mono_output
@@ -22,19 +23,42 @@
 # nuitka-project: --include-package=psutil
 
 import json
+import ctypes
+from ctypes import wintypes
 import multiprocessing as mp
 import os
 import sys
 import tempfile
 
-from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QAbstractNativeEventFilter,
+    QObject,
+    QThread,
+    QTimer,
+    QUrl,
+    QtMsgType,
+    qInstallMessageHandler,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWidgets import QApplication, QInputDialog, QMainWindow, QMenu, QSystemTrayIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QMenu,
+    QSystemTrayIcon,
+)
 
+from app_logging import (
+    LOG_DEBUG_ENV,
+    LOG_ENABLED_ENV,
+    LOG_PATH_ENV,
+    configure_logging,
+    get_logger,
+)
 from audio_capture import AudioCaptureThread
 from overlay import OverlayRadar
 
@@ -60,12 +84,53 @@ else:
 
 PROFILES_FILE = os.path.join(DATA_DIR, "profiles.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+LIFECYCLE_LOG_FILE = os.path.join(DATA_DIR, "lifecycle.log")
+_inherited_log_enabled = os.environ.get(LOG_ENABLED_ENV)
+_inherited_log_debug = os.environ.get(LOG_DEBUG_ENV)
+_logging_enabled = (
+    _inherited_log_enabled == "1"
+    if _inherited_log_enabled in ("0", "1")
+    else not IS_PACKAGED or "--debug" in sys.argv
+)
+_debug_logging = (
+    _inherited_log_debug == "1"
+    if _inherited_log_debug in ("0", "1")
+    else "--debug" in sys.argv
+)
+os.environ[LOG_ENABLED_ENV] = "1" if _logging_enabled else "0"
+os.environ[LOG_DEBUG_ENV] = "1" if _debug_logging else "0"
+LIFECYCLE_LOG_FILE = os.environ.get(LOG_PATH_ENV, LIFECYCLE_LOG_FILE)
+os.environ[LOG_PATH_ENV] = LIFECYCLE_LOG_FILE
+configure_logging(
+    LIFECYCLE_LOG_FILE,
+    enabled=_logging_enabled,
+    debug_enabled=_debug_logging,
+    console_enabled=_logging_enabled and __name__ == "__main__",
+)
+logger = get_logger("main")
+console_logger = get_logger("console")
+
+
+def _qt_message_handler(mode, context, message):
+    level = {
+        QtMsgType.QtDebugMsg: logger.debug,
+        QtMsgType.QtInfoMsg: logger.info,
+        QtMsgType.QtWarningMsg: logger.warning,
+        QtMsgType.QtCriticalMsg: logger.error,
+        QtMsgType.QtFatalMsg: logger.critical,
+    }.get(mode, logger.warning)
+    level("Qt message: %s", message)
+
+
+qInstallMessageHandler(_qt_message_handler)
 
 # Resolved against RESOURCE_DIR so it works both in dev and inside the
 # packaged .exe.
 DASHBOARD_FILE = os.path.join(RESOURCE_DIR, "dashboard_v2", "index.html")
 if __name__ == "__main__":
-    print(f"Dashboard: {DASHBOARD_FILE}  (exists: {os.path.exists(DASHBOARD_FILE)})")
+    logger.debug(
+        "dashboard path=%s exists=%s", DASHBOARD_FILE, os.path.exists(DASHBOARD_FILE)
+    )
 
 # App icon (window/taskbar). Use the PNG, which Qt core handles without an image
 # format plugin in the packaged executable. Nuitka uses the ICO for the executable
@@ -106,7 +171,12 @@ _UPDATE_CHECK_STARTED = False
 # them without reintroducing the leak.
 _PRESET_LEVEL_DEFAULTS = {"sensitivity": 0.005, "gain": 1.0}
 SOUND_PRESETS = {
-    "All Sounds": {**_PRESET_LEVEL_DEFAULTS, "freq_low": 20, "freq_high": 20000, "max_amp": 1.0}
+    "All Sounds": {
+        **_PRESET_LEVEL_DEFAULTS,
+        "freq_low": 20,
+        "freq_high": 20000,
+        "max_amp": 1.0,
+    }
 }
 INITIAL_PROFILE_PRESETS = {
     "Footsteps - CS2": {"freq_low": 150, "freq_high": 4000, "max_amp": 0.15},
@@ -136,7 +206,9 @@ def _initial_profiles() -> dict:
         values = {**_PRESET_LEVEL_DEFAULTS, **band}
         profiles[name] = {
             "name": name,
-            "sensitivity": round(values["sensitivity"] * PROFILE_SLIDER_SCALE["sensitivity"]),
+            "sensitivity": round(
+                values["sensitivity"] * PROFILE_SLIDER_SCALE["sensitivity"]
+            ),
             "gain": round(values["gain"] * PROFILE_SLIDER_SCALE["gain"]),
             "freq_low": values["freq_low"],
             "freq_high": values["freq_high"],
@@ -151,12 +223,13 @@ def _load_json_mapping(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         if isinstance(data, dict):
+            logger.debug("configuration loaded path=%s", path)
             return data
-        print(f"Ignoring non-object config file: {path}")
+        logger.warning("Ignoring non-object config file: %s", path)
     except FileNotFoundError:
         pass
-    except Exception as exc:
-        print(f"Config read skipped for {path}: {exc}")
+    except Exception:
+        logger.exception("Config read skipped for %s", path)
     return {}
 
 
@@ -176,9 +249,10 @@ def _save_json_mapping(path: str, data: dict) -> bool:
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
+        logger.debug("configuration saved path=%s", path)
         return True
-    except Exception as exc:
-        print(f"Config write skipped for {path}: {exc}")
+    except Exception:
+        logger.exception("Config write skipped for %s", path)
         return False
     finally:
         if temporary_path:
@@ -233,9 +307,9 @@ class UpdateCheckThread(QThread):
             url = data.get("html_url") or REPO_URL + "/releases/latest"
             if tag and _parse_version(tag) > _parse_version(APP_VERSION):
                 self.updateFound.emit(tag.lstrip("vV"), url)
-        except Exception:
-            # Silent by design - a failed update check must never bother the user.
-            pass
+        except Exception as exc:
+            # Optional network checks stay silent in the UI, but remain diagnosable.
+            logger.warning("update check failed: %s", exc)
 
 
 class ProgramListThread(QThread):
@@ -248,34 +322,273 @@ class ProgramListThread(QThread):
             from process_loopback import list_audio_programs
 
             names = [p["name"] for p in list_audio_programs()]
-        except Exception as exc:
-            print(f"Program enumeration failed: {exc}")
+        except Exception:
+            logger.exception("Program enumeration failed")
             names = []
         self.result.emit(json.dumps(names))
 
 
-class AppWebEnginePage(QWebEnginePage):
-    """Use the application name for JavaScript alert dialogs."""
+class GlobalHotkeyFilter(QAbstractNativeEventFilter):
+    """Register one Windows global hotkey and forward WM_HOTKEY to the app."""
 
-    def javaScriptAlert(self, security_origin, message):
-        from PyQt6.QtWidgets import QMessageBox
+    _WM_HOTKEY = 0x0312
+    _MOD_NOREPEAT = 0x4000
+    _MODIFIERS = {"CTRL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004}
+    _VK_NAMES = {
+        **{f"F{i}": 0x6F + i for i in range(1, 25)},
+        **{chr(code): code for code in range(ord("A"), ord("Z") + 1)},
+        **{str(number): ord(str(number)) for number in range(10)},
+        "SPACE": 0x20,
+        "INSERT": 0x2D,
+        "DELETE": 0x2E,
+        "HOME": 0x24,
+        "END": 0x23,
+        "PAGEUP": 0x21,
+        "PAGEDOWN": 0x22,
+        "UP": 0x26,
+        "DOWN": 0x28,
+        "LEFT": 0x25,
+        "RIGHT": 0x27,
+    }
+    _TEXT_KEYS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") | {"SPACE"}
+    _RESERVED = {"ALT+F4", "CTRL+ALT+DELETE"}
 
-        QMessageBox.information(self.parent(), "Visual Audio Overlay", message)
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.hotkey_id = 0x5641
+        self.registered = False
+        self._user32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
-    def javaScriptPrompt(self, security_origin, message, default_value):
-        value, accepted = QInputDialog.getText(
-            self.parent(), "New preset", message, text=default_value
+    @classmethod
+    def parse(cls, combo):
+        parts = [p.strip().upper() for p in str(combo or "").split("+") if p.strip()]
+        if len(parts) < 1:
+            return None
+        key = parts[-1]
+        if key not in cls._VK_NAMES:
+            return None
+        mods = 0
+        seen = set()
+        for modifier in parts[:-1]:
+            if modifier not in cls._MODIFIERS or modifier in seen:
+                return None
+            seen.add(modifier)
+            mods |= cls._MODIFIERS[modifier]
+        normalized = "+".join([m for m in cls._MODIFIERS if m in seen] + [key])
+        if normalized in cls._RESERVED:
+            return None
+        if key in cls._TEXT_KEYS and not mods & (
+            cls._MODIFIERS["CTRL"] | cls._MODIFIERS["ALT"]
+        ):
+            return None
+        return mods, cls._VK_NAMES[key], normalized
+
+    def unregister(self):
+        if self.registered and self._user32:
+            self._user32.UnregisterHotKey(int(self.owner.winId()), self.hotkey_id)
+            controller = getattr(self.owner, "hotkey_controller", None)
+            logger.info(
+                "global hotkey unregistered combo=%s", getattr(controller, "combo", "")
+            )
+        self.registered = False
+
+    def register(self, combo):
+        parsed = self.parse(combo)
+        if not parsed or not self._user32:
+            logger.warning("global hotkey registration skipped combo=%r", combo)
+            return False
+        self.unregister()
+        modifiers, vk, _ = parsed
+        ok = bool(
+            self._user32.RegisterHotKey(
+                int(self.owner.winId()),
+                self.hotkey_id,
+                modifiers | self._MOD_NOREPEAT,
+                vk,
+            )
         )
-        return accepted, value
+        self.registered = ok
+        if ok:
+            logger.info("global hotkey registered combo=%s", parsed[2])
+        else:
+            logger.warning(
+                "global hotkey registration failed combo=%s winerror=%s",
+                parsed[2],
+                ctypes.get_last_error(),
+            )
+        return ok
 
-    def javaScriptConfirm(self, security_origin, message):
-        from PyQt6.QtWidgets import QMessageBox
+    def nativeEventFilter(self, event_type, message):
+        if (
+            event_type
+            in (
+                b"windows_generic_MSG",
+                "windows_generic_MSG",
+                b"windows_dispatcher_MSG",
+                "windows_dispatcher_MSG",
+            )
+            and message
+            and self._user32
+        ):
+            msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
+            if msg.message == self._WM_HOTKEY and msg.wParam == self.hotkey_id:
+                controller = getattr(self.owner, "hotkey_controller", None)
+                if controller is not None:
+                    controller.handle_trigger()
+                return True, 0
+        return False, 0
 
-        answer = QMessageBox.question(
-            self.parent(), "Delete preset", message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+
+class HotkeyController:
+    """Single source of truth for shortcut configuration and registration state."""
+
+    def __init__(self, app, configured_combo):
+        self.app = app
+        self.filter = GlobalHotkeyFilter(app)
+        self.combo = ""
+        self.status = "unbound"
+        self.editing = False
+        self.registered = False
+        self._edit_combo = ""
+        self._edit_status = "unbound"
+        self._startup_registration_done = False
+        self._load(configured_combo)
+
+    @property
+    def state(self):
+        return {
+            "combo": self.combo,
+            "status": self.status,
+            "editing": self.editing,
+            "registered": self.registered,
+            "error": "",
+        }
+
+    def state_json(self, error=""):
+        state = dict(self.state)
+        state["error"] = error or ""
+        return json.dumps(state)
+
+    def _publish(self, error=""):
+        if hasattr(self.app, "bridge"):
+            self.app.bridge.hotkeyStateChanged.emit(self.state_json(error))
+        return self.state_json(error)
+
+    def _load(self, configured_combo):
+        raw = str(configured_combo or "").strip()
+        if not raw:
+            self.status = "unbound"
+            logger.info("hotkey loaded state=unbound")
+            return
+        parsed = GlobalHotkeyFilter.parse(raw)
+        if not parsed:
+            self.status = "unbound"
+            logger.warning("invalid saved hotkey ignored combo=%r", raw)
+            return
+        self.combo = parsed[2]
+        if self.filter.register(self.combo):
+            self.registered = True
+            self.status = "active"
+            logger.info("hotkey loaded combo=%s state=active", self.combo)
+        else:
+            self.status = "unavailable"
+            logger.warning("hotkey loaded combo=%s state=unavailable", self.combo)
+
+    def ensure_registered(self):
+        """Retry registration once the Qt window and native filter are ready."""
+        if self.editing or not self.combo:
+            return self.state_json()
+        if self._startup_registration_done and self.registered:
+            return self.state_json()
+        self.filter.unregister()
+        self.registered = False
+        if self.filter.register(self.combo):
+            self.registered = True
+            self.status = "active"
+            self._startup_registration_done = True
+            logger.info("hotkey registration ready combo=%s state=active", self.combo)
+            return self._publish()
+        self.status = "unavailable"
+        self.registered = False
+        self._startup_registration_done = True
+        logger.warning("hotkey registration retry unavailable combo=%s", self.combo)
+        return self._publish("That shortcut is already in use by another application.")
+
+    def _set_persisted_combo(self, combo):
+        self.app.settings["hotkey"] = combo
+        self.app._save_settings()
+
+    def handle_trigger(self):
+        if self.editing:
+            logger.debug("hotkey ignored during editing combo=%s", self.combo)
+            return
+        logger.info("hotkey invoked combo=%s", self.combo)
+        self.app.toggle_radar()
+
+    def begin_edit(self):
+        if self.editing:
+            return self.state_json()
+        self._edit_combo = self.combo
+        self._edit_status = self.status
+        self.editing = True
+        self.filter.unregister()
+        self.registered = False
+        self.status = "editing"
+        logger.info("hotkey edit started combo=%s", self._edit_combo)
+        return self._publish()
+
+    def commit(self, combo):
+        if not self.editing:
+            return self._publish("No hotkey edit is active.")
+        parsed = GlobalHotkeyFilter.parse(combo)
+        if not parsed:
+            logger.warning("hotkey commit rejected combo=%r", combo)
+            return self._publish(
+                "Use F1-F24 or a navigation key. Letters, numbers, and Space need Ctrl or Alt."
+            )
+        normalized = parsed[2]
+        if not self.filter.register(normalized):
+            logger.warning("hotkey commit unavailable combo=%s", normalized)
+            return self._publish(
+                "That shortcut is already in use by another application."
+            )
+        self.combo = normalized
+        self.registered = True
+        self.status = "active"
+        self.editing = False
+        self._set_persisted_combo(normalized)
+        logger.info("hotkey committed combo=%s state=active", normalized)
+        return self._publish()
+
+    def cancel(self):
+        if not self.editing:
+            return self._publish()
+        self.combo = self._edit_combo
+        self.editing = False
+        self.registered = False
+        if self.combo and self.filter.register(self.combo):
+            self.registered = True
+            self.status = "active"
+        elif self.combo:
+            self.status = "unavailable"
+            logger.warning("hotkey cancel restore unavailable combo=%s", self.combo)
+        else:
+            self.status = "unbound"
+        logger.info(
+            "hotkey edit cancelled restored_combo=%s state=%s", self.combo, self.status
         )
-        return answer == QMessageBox.StandardButton.Yes
+        return self._publish()
+
+    def clear(self):
+        self.filter.unregister()
+        self.combo = ""
+        self.editing = False
+        self.registered = False
+        self.status = "unbound"
+        self._set_persisted_combo("")
+        logger.info("hotkey cleared state=unbound")
+        return self._publish()
 
 
 class Bridge(QObject):
@@ -297,7 +610,10 @@ class Bridge(QObject):
         str
     )  # all five live audio params, so JS moves the sliders
     operationBusyChanged = pyqtSignal(bool)  # Start/End lifecycle lock
-    operationStateChanged = pyqtSignal(str)  # idle/starting/stopping
+    operationStateChanged = pyqtSignal(
+        str
+    )  # idle/starting/running/restarting/stopping/closing
+    hotkeyStateChanged = pyqtSignal(str)
 
     def __init__(self, app: "AudioRadarApp"):
         super().__init__()
@@ -311,6 +627,26 @@ class Bridge(QObject):
     @pyqtSlot()
     def stop_radar(self):
         self._app.stop_radar()
+
+    @pyqtSlot(result=str)
+    def get_hotkey_state(self):
+        return self._app.hotkey_controller.state_json()
+
+    @pyqtSlot(result=str)
+    def begin_hotkey_edit(self):
+        return self._app.hotkey_controller.begin_edit()
+
+    @pyqtSlot(str, result=str)
+    def commit_hotkey(self, combo: str):
+        return self._app.hotkey_controller.commit(combo)
+
+    @pyqtSlot(result=str)
+    def cancel_hotkey_edit(self):
+        return self._app.hotkey_controller.cancel()
+
+    @pyqtSlot(result=str)
+    def clear_hotkey(self):
+        return self._app.hotkey_controller.clear()
 
     # ── Audio Settings ────────────────────────────────────────────────
     @pyqtSlot(float)
@@ -330,6 +666,10 @@ class Bridge(QObject):
     def set_max_amplitude(self, val: float):
         self._app.set_audio_param("max_amp", val)
 
+    @pyqtSlot()
+    def commit_audio_settings(self):
+        self._app.commit_audio_settings()
+
     @pyqtSlot(str)
     def apply_preset(self, name: str):
         self._app.apply_preset(name)
@@ -343,21 +683,33 @@ class Bridge(QObject):
         try:
             state = json.loads(json_str)
             if isinstance(state, dict):
+                logger.debug(
+                    "preset state changed id=%s dirty=%s",
+                    state.get("id", "builtin:all-sounds"),
+                    bool(state.get("dirty", False)),
+                )
                 self._app.settings["preset_state"] = {
                     "id": str(state.get("id", "builtin:all-sounds")),
                     "dirty": bool(state.get("dirty", False)),
                 }
                 self._app.preset_state = dict(self._app.settings["preset_state"])
+                # Keep the preset state on the same debounced persistence path as
+                # live audio settings. This is important when Reset clears dirty:
+                # an in-memory-only update would return after the next restart.
                 self._app._queue_settings_save()
+            else:
+                logger.warning("invalid preset state shape ignored")
         except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+            logger.warning("invalid preset state payload ignored")
 
     @pyqtSlot(bool)
     def set_invert(self, invert: bool):
+        logger.info("invert direction changed enabled=%s", bool(invert))
         self._app.invert_direction = invert
 
     @pyqtSlot(int)
     def set_monitor(self, idx: int):
+        logger.info("monitor changed index=%s", idx)
         self._app.selected_monitor = idx
 
     @pyqtSlot(str)
@@ -409,18 +761,22 @@ class Bridge(QObject):
 
     @pyqtSlot(bool)
     def set_overlay_drag_enabled(self, enabled: bool):
+        logger.info("overlay drag changed enabled=%s", bool(enabled))
         self._app.set_overlay_drag_enabled(enabled)
 
     @pyqtSlot(int, int)
     def set_overlay_position(self, x: int, y: int):
+        logger.info("overlay position requested x=%s y=%s", x, y)
         self._app.move_overlay(x, y)
 
     @pyqtSlot(int, int)
     def nudge_overlay(self, dx: int, dy: int):
+        logger.debug("overlay nudge requested dx=%s dy=%s", dx, dy)
         self._app.nudge_overlay(dx, dy)
 
     @pyqtSlot()
     def reset_overlay_position(self):
+        logger.info("overlay position reset requested")
         self._app.reset_overlay_position()
 
     # ── Overlay Appearance ────────────────────────────────────────────
@@ -432,6 +788,10 @@ class Bridge(QObject):
     def set_stroke_width(self, width: int):
         self._app.set_stroke_width(width)
 
+    @pyqtSlot()
+    def commit_appearance(self):
+        self._app.commit_appearance()
+
     # ── Profiles ──────────────────────────────────────────────────────
     @pyqtSlot(str)
     def save_profile(self, json_str: str):
@@ -442,12 +802,13 @@ class Bridge(QObject):
             if not name:
                 return
             data["name"] = name
+            logger.info("preset saved name=%s", name)
             self._app.profiles[name] = data
             self._app._save_profiles()
             self._app.set_selected_preset(f"profile:{name}")
             self.profilesChanged.emit(json.dumps(self._app.profiles))
-        except Exception as e:
-            print(f"save_profile error: {e}")
+        except Exception:
+            logger.exception("save_profile failed")
 
     @pyqtSlot(str, result=str)
     def get_profile(self, name: str) -> str:
@@ -458,6 +819,7 @@ class Bridge(QObject):
     @pyqtSlot(str)
     def delete_profile(self, name: str):
         if name in self._app.profiles:
+            logger.info("preset deleted name=%s", name)
             del self._app.profiles[name]
             self._app._save_profiles()
             # Deleting the profile that is currently selected would leave a name
@@ -499,13 +861,23 @@ class Bridge(QObject):
         # profile cannot overwrite settings changed after it was chosen.
         self._app.emit_audio_settings()
 
+        self.hotkeyStateChanged.emit(self._app.hotkey_controller.state_json())
+
         # Profiles
         self.profilesChanged.emit(json.dumps(self._app.profiles))
 
         # Permanent builtin preset. Other initial presets live in profiles.json.
-        self.presetsChanged.emit(json.dumps([
-            {"id": "builtin:all-sounds", "name": "All Sounds", "can_delete": False}
-        ]))
+        self.presetsChanged.emit(
+            json.dumps(
+                [
+                    {
+                        "id": "builtin:all-sounds",
+                        "name": "All Sounds",
+                        "can_delete": False,
+                    }
+                ]
+            )
+        )
 
         # Running audio programs (for per-app capture)
         self._app.emit_programs()
@@ -526,6 +898,7 @@ class Bridge(QObject):
 class AudioRadarApp(QMainWindow):
     def __init__(self, single_instance_server=None):
         super().__init__()
+        logger.info("application window initialization started")
         self.setWindowTitle("Visual Audio Overlay")
         if os.path.exists(APP_ICON):
             self.setWindowIcon(QIcon(APP_ICON))
@@ -538,7 +911,10 @@ class AudioRadarApp(QMainWindow):
         self._capture_watchdog.setInterval(10000)
         self._capture_watchdog.timeout.connect(self._on_capture_timeout)
         self._program_list_thread = None
-        self._pending_capture_restart = False
+        self._capture_generation = 0
+        self._active_capture_generation = None
+        self._watchdog_generation = None
+        self._restart_requested = False
         self._capture_terminal_error = None
         self._single_instance_server = single_instance_server
         if self._single_instance_server is not None:
@@ -550,9 +926,14 @@ class AudioRadarApp(QMainWindow):
         self.invert_direction = False
         self.selected_monitor = 0
         self.selected_program = None  # None = whole-system audio; else a program name
-        fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(SETTINGS_FILE)
+        fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(
+            SETTINGS_FILE
+        )
         self.profiles = self._load_profiles()
         self.settings = self._load_settings()
+        if "hotkey" not in self.settings:
+            self.settings["hotkey"] = "F8"
+            self._save_settings()
         # Monitor and program are session-only choices; never restore stale
         # values from a previous run.
         removed_session_keys = any(
@@ -611,13 +992,18 @@ class AudioRadarApp(QMainWindow):
             else "builtin:all-sounds"
         )
         saved_state = self.settings.get("preset_state")
-        self.preset_state = saved_state if isinstance(saved_state, dict) else {
-            "id": self.selected_preset,
-            "dirty": False,
-        }
+        self.preset_state = (
+            saved_state
+            if isinstance(saved_state, dict)
+            else {
+                "id": self.selected_preset,
+                "dirty": False,
+            }
+        )
         value = self.preset_state.get("id", "")
         valid = value == "builtin:all-sounds" or (
-            isinstance(value, str) and value.startswith("profile:")
+            isinstance(value, str)
+            and value.startswith("profile:")
             and value[8:] in self.profiles
         )
         if not valid:
@@ -663,7 +1049,6 @@ class AudioRadarApp(QMainWindow):
 
         # WebEngine view
         self.view = QWebEngineView()
-        self.view.setPage(AppWebEnginePage(self.view))
 
         # WebChannel - registers `bridge` as `window.bridge` in JS
         self.channel = QWebChannel()
@@ -671,6 +1056,13 @@ class AudioRadarApp(QMainWindow):
         self.view.page().setWebChannel(self.channel)
 
         self.setCentralWidget(self.view)
+
+        configured_hotkey = self.settings.get("hotkey", "F8")
+        self.hotkey_controller = HotkeyController(self, configured_hotkey)
+        QApplication.instance().installNativeEventFilter(self.hotkey_controller.filter)
+        # Register once more after the native filter and window event loop are
+        # ready.  This avoids losing startup WM_HOTKEY messages on Windows.
+        QTimer.singleShot(0, self.hotkey_controller.ensure_registered)
 
         # Load the dashboard HTML
         self.view.setUrl(QUrl.fromLocalFile(DASHBOARD_FILE))
@@ -686,6 +1078,13 @@ class AudioRadarApp(QMainWindow):
             self.update_thread = UpdateCheckThread()
             self.update_thread.updateFound.connect(self.bridge.updateAvailable)
             self.update_thread.start()
+        logger.info("application window initialization completed")
+
+    def toggle_radar(self):
+        if self.radar_operation_state in ("starting", "running", "restarting"):
+            self.stop_radar()
+        else:
+            self.start_radar()
 
     def _setup_tray_icon(self):
         icon_path = TRAY_ICON if os.path.exists(TRAY_ICON) else APP_ICON
@@ -724,6 +1123,11 @@ class AudioRadarApp(QMainWindow):
             self._restore_from_tray()
 
     def _exit_from_tray(self):
+        logger.info(
+            "tray exit requested state=%s thread_running=%s",
+            self.radar_operation_state,
+            self.audio_thread is not None and self.audio_thread.isRunning(),
+        )
         self._closing_for_exit = True
         self.close()
 
@@ -741,25 +1145,71 @@ class AudioRadarApp(QMainWindow):
         """Non-terminal capture status intended for the UI."""
         self.bridge.statusChanged.emit(message, self.radar_active)
 
-    def _on_capture_error(self, message: str):
-        """Remember terminal capture errors so cleanup cannot overwrite them."""
-        self._capture_terminal_error = message
+    def _capture_sender_generation(self):
+        sender = self.sender()
+        if sender is not self.audio_thread:
+            return None
+        return getattr(sender, "_capture_generation", None)
+
+    def _on_capture_audio(self, angle, intensity):
+        if self._capture_sender_generation() != self._active_capture_generation:
+            return
+        if self.radar_operation_state not in ("starting", "running"):
+            return
+        self.on_audio_data(angle, intensity)
+
+    def _on_capture_status(self, message):
+        if self._capture_sender_generation() != self._active_capture_generation:
+            return
+        if self.radar_operation_state in ("restarting", "stopping", "closing", "idle"):
+            return
+        self.on_capture_status(message)
+
+    def _on_capture_device(self, name, channels):
+        if self._capture_sender_generation() == self._active_capture_generation:
+            self.on_device_info(name, channels)
+
+    def _on_capture_error(self, message):
+        logger.error(
+            "capture error generation=%s state=%s message=%r",
+            self._capture_sender_generation(),
+            self.radar_operation_state,
+            message,
+        )
+        if self._capture_sender_generation() != self._active_capture_generation:
+            logger.debug("capture error ignored: stale sender")
+            return
+        if self.radar_operation_state == "closing":
+            return
+        if self._capture_terminal_error is None:
+            self._capture_terminal_error = message
+            self.bridge.statusChanged.emit(message, False)
         self.radar_active = False
         self.overlay.hide()
-        self.bridge.statusChanged.emit(message, False)
+        if self.radar_operation_state in ("starting", "running"):
+            self._set_operation_state(
+                "restarting" if self._restart_requested else "stopping"
+            )
+            self.audio_thread.request_stop()
 
     def _new_audio_thread(self):
-        """QThreads aren't restartable, so a fresh (idle) thread is created here
-        on init, after every Stop, and on every mid-session capture restart."""
-        self.audio_thread = AudioCaptureThread()
-        self.audio_thread.audio_data_signal.connect(self.on_audio_data)
-        self.audio_thread.device_info_signal.connect(self.on_device_info)
-        self.audio_thread.status_signal.connect(self.on_capture_status)
-        self.audio_thread.error_signal.connect(self._on_capture_error)
-        self.audio_thread.ready_signal.connect(self._on_capture_ready)
-        self.audio_thread.finished.connect(self._on_capture_finished)
+        """Create an idle thread and bind every callback to its generation."""
+        self._capture_generation += 1
+        generation = self._capture_generation
+        thread = AudioCaptureThread()
+        thread._capture_generation = generation
+        self.audio_thread = thread
+        self._active_capture_generation = generation
+        thread.audio_data_signal.connect(self._on_capture_audio)
+        thread.device_info_signal.connect(self._on_capture_device)
+        thread.status_signal.connect(self._on_capture_status)
+        thread.error_signal.connect(self._on_capture_error)
+        thread.ready_signal.connect(self._on_capture_ready)
+        thread.finished.connect(self._on_capture_finished)
+        logger.debug("new capture thread generation=%s", generation)
 
     def on_overlay_position_changed(self, x: int, y: int):
+        logger.info("overlay position persisted x=%s y=%s", x, y)
         self.settings["overlay_position"] = {"x": int(x), "y": int(y)}
         self._save_settings()
         self.emit_overlay_position()
@@ -788,7 +1238,9 @@ class AudioRadarApp(QMainWindow):
     def set_program(self, program):
         """Change the capture target. Applies live when the radar is running."""
         if program == self.selected_program:
+            logger.debug("program unchanged name=%s", program)
             return
+        logger.info("program changed from=%s to=%s", self.selected_program, program)
         self.selected_program = program
         self._restart_capture_if_active()
 
@@ -798,8 +1250,8 @@ class AudioRadarApp(QMainWindow):
             from process_loopback import list_audio_programs
 
             return list_audio_programs()
-        except Exception as e:
-            print(f"Program enumeration failed: {e}")
+        except Exception:
+            logger.exception("Program enumeration failed")
             return []
 
     def emit_programs(self):
@@ -807,7 +1259,9 @@ class AudioRadarApp(QMainWindow):
             self._program_list_thread is not None
             and self._program_list_thread.isRunning()
         ):
+            logger.debug("program list refresh skipped: already running")
             return
+        logger.debug("program list refresh started")
         self._program_list_thread = ProgramListThread(self)
         self._program_list_thread.result.connect(self.bridge.programsChanged)
         self._program_list_thread.finished.connect(self._on_program_list_finished)
@@ -818,18 +1272,42 @@ class AudioRadarApp(QMainWindow):
         self._program_list_thread = None
         if thread is not None:
             thread.deleteLater()
+        logger.debug("program list refresh finished")
+
+    def _stop_program_list_thread(self):
+        thread = self._program_list_thread
+        self._program_list_thread = None
+        if thread is None:
+            return
+        logger.debug("stopping program list thread running=%s", thread.isRunning())
+        if thread.isRunning():
+            thread.requestInterruption()
+            thread.terminate()
+            thread.wait()
+            logger.debug("program list thread stopped")
+        else:
+            thread.deleteLater()
 
     # ── Overlay appearance (accent colour + stroke) ───────────────────
     def set_accent_color(self, hex_color: str):
+        logger.info("accent color changed value=%s", hex_color)
         self.accent_color = hex_color or "#9751F2"
         self.overlay.set_accent_color(self.accent_color)
         self.settings["accent_color"] = self.accent_color
         self._queue_settings_save()
 
     def set_stroke_width(self, width: int):
+        logger.debug("stroke width changed value=%s", width)
         self.stroke_width = int(width)
         self.overlay.set_stroke_width(self.stroke_width)
         self.settings["stroke_width"] = self.stroke_width
+
+    def commit_appearance(self):
+        logger.info(
+            "appearance settings committed color=%s thickness=%s",
+            self.accent_color,
+            self.stroke_width,
+        )
         self._queue_settings_save()
 
     def emit_appearance(self):
@@ -848,6 +1326,9 @@ class AudioRadarApp(QMainWindow):
     def set_mono_enabled(self, enabled: bool):
         enabled = bool(enabled)
         changed = enabled != self.mono_enabled
+        logger.info(
+            "mono output enabled changed from=%s to=%s", self.mono_enabled, enabled
+        )
         self.mono_enabled = enabled
         self.settings["mono_enabled"] = self.mono_enabled
         self._queue_settings_save()
@@ -858,6 +1339,9 @@ class AudioRadarApp(QMainWindow):
     def set_mono_output(self, device: str):
         device = device or None
         changed = device != self.mono_device
+        logger.info(
+            "mono output device changed from=%s to=%s", self.mono_device, device
+        )
         self.mono_device = device
         self.settings["mono_device"] = self.mono_device
         self._queue_settings_save()
@@ -878,8 +1362,8 @@ class AudioRadarApp(QMainWindow):
             devices = list_output_devices()
             default = default_output_name()
             cable = detect_virtual_cable()
-        except Exception as e:
-            print(f"Mono device enumeration failed: {e}")
+        except Exception:
+            logger.exception("Mono device enumeration failed")
             devices, default, cable = [], None, None
 
         state = {
@@ -911,8 +1395,8 @@ class AudioRadarApp(QMainWindow):
                 shutil.copyfile(installer, tmp)
                 ctypes.windll.shell32.ShellExecuteW(None, "runas", tmp, None, None, 1)
                 return
-            except Exception as e:
-                print(f"VB-CABLE launch failed: {e}")
+            except Exception:
+                logger.exception("VB-CABLE launch failed")
         import webbrowser
 
         webbrowser.open("https://vb-audio.com/Cable/")
@@ -926,7 +1410,12 @@ class AudioRadarApp(QMainWindow):
             from process_loopback import resolve_pid
 
             pid = resolve_pid(self.selected_program)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "program target resolution failed name=%s: %s",
+                self.selected_program,
+                exc,
+            )
             pid = None
         if pid is None:
             return None, None
@@ -961,8 +1450,13 @@ class AudioRadarApp(QMainWindow):
             if key in saved:
                 try:
                     self.audio_settings[key] = cast(saved[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "invalid audio setting ignored key=%s value=%r: %s",
+                        key,
+                        saved[key],
+                        exc,
+                    )
 
     def _queue_settings_save(self):
         """Stage live settings and debounce the disk write."""
@@ -987,11 +1481,19 @@ class AudioRadarApp(QMainWindow):
         self.bridge.audioSettingsChanged.emit(json.dumps(self.audio_settings))
 
     def set_audio_param(self, key: str, value):
-        """Update one live audio parameter. Stored on the app (so it survives a
-        thread restart), applied to the running thread immediately, and queued for
-        persistence so it also survives a restart."""
+        """Update one live audio parameter and apply it immediately.
+
+        Persistence is committed separately when the editing gesture settles.
+        """
+        previous = self.audio_settings.get(key)
         self.audio_settings[key] = value
+        logger.debug(
+            "audio parameter changed key=%s from=%s to=%s", key, previous, value
+        )
         self._apply_audio_settings_to_thread()
+
+    def commit_audio_settings(self):
+        logger.info("audio settings committed values=%s", self.audio_settings)
         self._queue_settings_save()
 
     def set_selected_preset(self, name: str):
@@ -1003,7 +1505,9 @@ class AudioRadarApp(QMainWindow):
         file with identical contents on every launch."""
         name = name or "builtin:all-sounds"
         if name == self.selected_preset:
+            logger.debug("preset selection unchanged id=%s", name)
             return
+        logger.info("preset selected from=%s to=%s", self.selected_preset, name)
         self._flush_pending_saves()
         self.selected_preset = name
         self.preset_state = {"id": name, "dirty": False}
@@ -1012,10 +1516,14 @@ class AudioRadarApp(QMainWindow):
         self._save_settings()
 
     def emit_selected_preset(self):
-        self.bridge.selectedPresetChanged.emit(json.dumps({
-            "id": self.preset_state.get("id", self.selected_preset),
-            "dirty": bool(self.preset_state.get("dirty", False)),
-        }))
+        self.bridge.selectedPresetChanged.emit(
+            json.dumps(
+                {
+                    "id": self.preset_state.get("id", self.selected_preset),
+                    "dirty": bool(self.preset_state.get("dirty", False)),
+                }
+            )
+        )
 
     def apply_preset(self, name: str):
         """Apply a built-in preset and echo the values back to the dashboard so the
@@ -1025,7 +1533,9 @@ class AudioRadarApp(QMainWindow):
         Every parameter is overwritten, never just the ones the preset cares about
         - see the note on SOUND_PRESETS for why a partial apply leaks."""
         if name != "builtin:all-sounds":
+            logger.warning("unknown preset apply ignored id=%s", name)
             return
+        logger.info("preset applied id=%s", name)
         p = SOUND_PRESETS["All Sounds"]
         for key in self.audio_settings:
             self.audio_settings[key] = p[key]
@@ -1037,6 +1547,15 @@ class AudioRadarApp(QMainWindow):
     def _start_capture_thread(self):
         """Configure the idle thread (target/mono/params are read at thread start)
         and start it. Shared by Start and by mid-session capture restarts."""
+        if self._closing_for_exit or self.audio_thread is None:
+            logger.debug("capture start skipped: closing or no thread")
+            return False
+        if self.audio_thread.isRunning():
+            logger.debug(
+                "capture start skipped: thread already running generation=%s",
+                self._active_capture_generation,
+            )
+            return False
         # Resolve the capture target fresh (PIDs change between launches).
         pid, name = self._resolve_target()
         self.audio_thread.set_target(pid, name)
@@ -1047,23 +1566,44 @@ class AudioRadarApp(QMainWindow):
         self._apply_audio_settings_to_thread()
 
         if not self.audio_thread.isRunning():
+            logger.info(
+                "starting capture thread generation=%s target_pid=%s target_name=%r",
+                self._active_capture_generation,
+                pid,
+                name,
+            )
             self.audio_thread.start()
 
         # The UI remains in a loading state until the worker emits ready_signal.
         self.bridge.statusChanged.emit("Starting audio capture...", False)
+        return True
 
     def _set_operation_state(self, state):
+        previous = self.radar_operation_state
         self.radar_operation_state = state
-        self.bridge.operationBusyChanged.emit(state != "idle")
+        logger.info("operation state %s -> %s", previous, state)
+        self.bridge.operationBusyChanged.emit(
+            state in ("starting", "restarting", "stopping", "closing")
+        )
         self.bridge.operationStateChanged.emit(state)
 
     def _on_capture_ready(self):
+        logger.debug(
+            "capture ready generation=%s active_generation=%s state=%s",
+            self._capture_sender_generation(),
+            self._active_capture_generation,
+            self.radar_operation_state,
+        )
+        if self._capture_sender_generation() != self._active_capture_generation:
+            logger.debug("capture ready ignored: stale sender")
+            return
         if self.radar_operation_state != "starting":
             return
         self._capture_watchdog.stop()
+        self._watchdog_generation = None
         self._capture_terminal_error = None
         self.radar_active = True
-        self._set_operation_state("idle")
+        self._set_operation_state("running")
         if self.selected_program and self._capture_label != "system audio":
             self.bridge.statusChanged.emit(
                 f"Radar active - capturing {self._capture_label}", True
@@ -1074,6 +1614,8 @@ class AudioRadarApp(QMainWindow):
     def _on_capture_timeout(self):
         if self.radar_operation_state != "starting":
             return
+        if self._watchdog_generation != self._active_capture_generation:
+            return
         label = (
             getattr(self, "_capture_label", None)
             or self.selected_program
@@ -1082,71 +1624,126 @@ class AudioRadarApp(QMainWindow):
         self._capture_terminal_error = (
             f"Capture of {label} stopped unexpectedly - restart the radar"
         )
-        print(self._capture_terminal_error)
+        logger.error("%s", self._capture_terminal_error)
         self.radar_active = False
         self.overlay.hide()
         self._set_operation_state("stopping")
-        self.audio_thread.request_stop()
+        if self.audio_thread is not None:
+            self.audio_thread.request_stop()
 
     def _on_capture_finished(self):
-        if self.radar_operation_state not in ("starting", "stopping"):
+        sender = self.sender()
+        sender_generation = getattr(sender, "_capture_generation", None)
+        logger.debug(
+            "capture finished signal sender_generation=%s active_generation=%s state=%s",
+            sender_generation,
+            self._active_capture_generation,
+            self.radar_operation_state,
+        )
+        if self._capture_sender_generation() != self._active_capture_generation:
+            logger.debug("capture finished ignored: stale sender")
             return
         self._capture_watchdog.stop()
+        self._watchdog_generation = None
         self.radar_active = False
         self.overlay.hide()
-        if self._closing_for_exit:
+        state = self.radar_operation_state
+        if state == "closing":
+            self._active_capture_generation = None
+            logger.info("capture finished during closing; finalizing exit")
             self._finalize_exit()
             return
-        if self._pending_capture_restart:
-            self._pending_capture_restart = False
-            self._capture_terminal_error = None
-            self._new_audio_thread()
-            # Finishing the old capture hides the overlay; show it again for the
-            # replacement thread without moving the user's chosen position.
-            self.overlay.show()
-            self._set_operation_state("starting")
-            self._start_capture_thread()
-            self._capture_watchdog.start()
-            return
+
+        restart = self._restart_requested and state == "restarting"
+        terminal_error = self._capture_terminal_error
+        self._active_capture_generation = None
         self._new_audio_thread()
+        if restart:
+            self._restart_requested = False
+            self._capture_terminal_error = None
+            self._begin_capture_start(place_overlay=False)
+            return
+
+        self._restart_requested = False
         self._set_operation_state("idle")
-        message = self._capture_terminal_error or "Radar stopped"
+        message = terminal_error or (
+            "Capture stopped unexpectedly - restart the radar"
+            if state in ("starting", "running")
+            else "Radar stopped"
+        )
         self._capture_terminal_error = None
         self.bridge.statusChanged.emit(message, False)
         self.emit_overlay_position()
 
-    def start_radar(self):
-        if self.radar_operation_state != "idle":
+    def _begin_capture_start(self, place_overlay):
+        if self._closing_for_exit:
+            logger.debug("start request ignored: application is closing")
             return
+        if self.radar_operation_state not in ("idle", "restarting"):
+            logger.debug("start request ignored: state=%s", self.radar_operation_state)
+            return
+        logger.info("radar start requested place_overlay=%s", place_overlay)
         self._set_operation_state("starting")
         self._capture_terminal_error = None
         self.radar_active = False
         self.overlay.show()
-        self._place_overlay_for_start()
-        self._start_capture_thread()
-        self._capture_watchdog.start()
-        # Refresh the program list so newly launched apps show up next time.
-        self.emit_programs()
+        if place_overlay:
+            self._place_overlay_for_start()
+        if self._start_capture_thread():
+            self._watchdog_generation = self._active_capture_generation
+            self._capture_watchdog.start()
+            return
+        self._capture_terminal_error = "Unable to start audio capture"
+        self.overlay.hide()
+        self._set_operation_state("idle")
+        self.bridge.statusChanged.emit(self._capture_terminal_error, False)
+        logger.error("radar start failed: unable to start capture thread")
+        self._capture_terminal_error = None
+
+    def start_radar(self):
+        logger.info("start_radar invoked")
+        self._begin_capture_start(place_overlay=True)
 
     def _restart_capture_if_active(self):
-        """Program/mono choices only take effect when the capture thread starts,
-        so apply a mid-session change by restarting the thread in place. The
-        overlay stays up; only the capture source blips out for a moment."""
-        if not self.radar_active:
+        """Queue a restart so the latest runtime target is applied atomically."""
+        if self._closing_for_exit:
+            logger.debug("capture restart ignored: application is closing")
             return
-        self._pending_capture_restart = True
-        self._set_operation_state("stopping")
-        self.audio_thread.request_stop()
+        state = self.radar_operation_state
+        if state == "restarting":
+            logger.debug("capture restart coalesced: restart already pending")
+            self._restart_requested = True
+            return
+        if state not in ("starting", "running"):
+            logger.debug("capture restart ignored: state=%s", state)
+            return
+        logger.info("capture restart requested state=%s", state)
+        self._restart_requested = True
+        self.radar_active = False
+        self.overlay.hide()
+        self._set_operation_state("restarting")
+        self._capture_watchdog.stop()
+        self._watchdog_generation = None
+        if self.audio_thread is not None:
+            self.audio_thread.request_stop()
 
     def stop_radar(self):
-        if self.radar_operation_state != "idle":
+        if self._closing_for_exit:
+            logger.debug("stop request ignored: application is closing")
             return
+        if self.radar_operation_state not in ("starting", "running", "restarting"):
+            logger.debug("stop request ignored: state=%s", self.radar_operation_state)
+            return
+        logger.info("radar stop requested state=%s", self.radar_operation_state)
+        self._restart_requested = False
         self.radar_active = False
         self.overlay.set_drag_enabled(False)
         self.overlay.hide()
         self._set_operation_state("stopping")
         self._capture_watchdog.stop()
-        self.audio_thread.request_stop()
+        self._watchdog_generation = None
+        if self.audio_thread is not None:
+            self.audio_thread.request_stop()
 
     def _selected_monitor_center_position(self):
         screens = QApplication.screens()
@@ -1185,6 +1782,7 @@ class AudioRadarApp(QMainWindow):
 
     def set_overlay_drag_enabled(self, enabled: bool):
         enabled = bool(enabled)
+        logger.info("overlay drag changed enabled=%s", enabled)
         if enabled and not self.overlay.isVisible():
             self.overlay.show()
             self._place_overlay_for_start()
@@ -1215,14 +1813,17 @@ class AudioRadarApp(QMainWindow):
 
     def reset_overlay_position(self):
         x, y = self._selected_monitor_center_position()
+        logger.info("overlay position reset x=%s y=%s", x, y)
         self.move_overlay(x, y)
 
     # ── Profiles ──────────────────────────────────────────────────────
     def _load_profiles(self) -> dict:
         profiles = _load_json_mapping(PROFILES_FILE)
-        if not all(isinstance(name, str) and isinstance(profile, dict)
-                   for name, profile in profiles.items()):
-            print(f"Ignoring incompatible profiles file: {PROFILES_FILE}")
+        if not all(
+            isinstance(name, str) and isinstance(profile, dict)
+            for name, profile in profiles.items()
+        ):
+            logger.warning("Ignoring incompatible profiles file: %s", PROFILES_FILE)
             profiles = {}
         if not os.path.exists(PROFILES_FILE):
             _save_json_mapping(PROFILES_FILE, profiles)
@@ -1234,7 +1835,7 @@ class AudioRadarApp(QMainWindow):
     def _load_settings(self) -> dict:
         settings = _load_json_mapping(SETTINGS_FILE)
         if not isinstance(settings, dict):
-            print(f"Ignoring incompatible settings file: {SETTINGS_FILE}")
+            logger.warning("Ignoring incompatible settings file: %s", SETTINGS_FILE)
             settings = {}
         if not os.path.exists(SETTINGS_FILE):
             _save_json_mapping(SETTINGS_FILE, settings)
@@ -1245,27 +1846,61 @@ class AudioRadarApp(QMainWindow):
 
     # ── Lifecycle ─────────────────────────────────────────────────────
     def closeEvent(self, event):
+        logger.info(
+            "closeEvent closing_for_exit=%s finalized=%s state=%s thread_running=%s",
+            self._closing_for_exit,
+            self._exit_finalized,
+            self.radar_operation_state,
+            self.audio_thread is not None and self.audio_thread.isRunning(),
+        )
         if not self._closing_for_exit:
             self._flush_pending_saves()
             self.hide()
             event.ignore()
             return
 
+        if hasattr(self, "hotkey_controller"):
+            self.hotkey_controller.filter.unregister()
+            QApplication.instance().removeNativeEventFilter(
+                self.hotkey_controller.filter
+            )
+
         self._flush_pending_saves()
+        if self._exit_finalized:
+            logger.debug("closeEvent accepted after exit finalized")
+            event.accept()
+            return
+        if self.radar_operation_state == "closing":
+            logger.debug("closeEvent ignored while exit is still stopping")
+            event.ignore()
+            return
         event.ignore()
+        self._closing_for_exit = True
+        self._restart_requested = False
         self.radar_active = False
         self.overlay.hide()
         self._capture_watchdog.stop()
-        if self.audio_thread.isRunning():
-            self._set_operation_state("stopping")
+        self._watchdog_generation = None
+        self._stop_program_list_thread()
+        self._set_operation_state("closing")
+        if self.audio_thread is not None and self.audio_thread.isRunning():
+            logger.info(
+                "requesting capture stop generation=%s",
+                self._active_capture_generation,
+            )
             self.audio_thread.request_stop()
         else:
+            logger.info("capture thread already stopped; finalizing exit")
             self._finalize_exit()
 
     def _finalize_exit(self):
         if self._exit_finalized:
+            logger.debug("finalize exit skipped: already finalized")
             return
         self._exit_finalized = True
+        logger.info("finalizing application exit")
+        console_logger.info("Visual Audio Overlay stopped")
+        self._capture_watchdog.stop()
         if self.tray_icon:
             self.tray_icon.hide()
         if self._single_instance_server is not None:
@@ -1299,6 +1934,28 @@ def _acquire_single_instance():
 
 if __name__ == "__main__":
     mp.freeze_support()
+    console_logger.info(
+        "\n"
+        " __     ___                 _      _             _ _       \n"
+        " \\ \\   / (_)___ _   _  __ _| |    / \\  _   _  __| (_) ___  \n"
+        "  \\ \\ / /| / __| | | |/ _` | |   / _ \\| | | |/ _` | |/ _ \\ \n"
+        "   \\ V / | \\__ \\ |_| | (_| | |  / ___ \\ |_| | (_| | | (_) |\n"
+        "    \\_/  |_|___/\\__,_|\\__,_|_| /_/   \\_\\__,_|\\__,_|_|\\___/ \n"
+        "\n"
+        "              ___                 _             \n"
+        "             / _ \\__   _____ _ __| | __ _ _   _ \n"
+        "            | | | \\ \\ / / _ \\ '__| |/ _` | | | |\n"
+        "            | |_| |\\ V /  __/ |  | | (_| | |_| |\n"
+        "             \\___/  \\_/ \\___|_|  |_|\\__,_|\\__, |\n"
+        "                                           \\___| \n"
+        "\n"
+        "                 [ SIGNAL IN ] -> [ RADAR OUT ]"
+    )
+    console_logger.info(
+        "Starting Visual Audio Overlay (logging=%s, level=%s)",
+        "enabled" if _logging_enabled else "disabled",
+        "DEBUG" if _debug_logging else "INFO",
+    )
     # Windows groups taskbar buttons (and picks their icon) by AppUserModelID.
     # Without an explicit ID, a `python main.py` launch shows the generic Python
     # icon in the taskbar even though setWindowIcon is set. Declaring our own ID
@@ -1310,10 +1967,11 @@ if __name__ == "__main__":
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 "VisualAudioOverlay.App"
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("AppUserModelID setup failed: %s", exc)
 
-    app = QApplication(sys.argv)
+    qt_args = [arg for arg in sys.argv if arg != "--debug"]
+    app = QApplication(qt_args)
     single_instance_server = _acquire_single_instance()
     if single_instance_server is None:
         sys.exit(0)

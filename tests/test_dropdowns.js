@@ -1,14 +1,13 @@
-// Dropdown-fill and preset-restore tests for dashboard_v2/script.js.
+// Dashboard interaction regression tests for dashboard_v2/script.js.
 //
 // Run:  node tests/test_dropdowns.js       (exit 0 = pass)
 //
-// NOT wired into .github/workflows/ci.yml, which only runs pytest - adding a
-// node step is a separate call. Loads the real script.js against a minimal DOM
-// stub; the bootstrap never fires because the stub swallows DOMContentLoaded.
+// Loads the real script.js against a minimal DOM stub; the bootstrap never
+// fires because the stub swallows DOMContentLoaded.
 //
 // Covers the two things that broke in this area: QtWebEngine growing a <select>
 // whose options are swapped while its native popup is open, and the saved preset
-// name being restored across the two separate signals that build the dropdown.
+// stable id being restored across the two separate signals that build the dropdown.
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
@@ -37,15 +36,28 @@ class Select {
 }
 
 class Generic {
-    constructor(id) { this.id = id; this.value = ""; this.textContent = ""; this.checked = false;
-        this.style = { setProperty() {} }; this.classList = { toggle() {}, add() {}, remove() {} };
-        this.dataset = { min: "20", max: "20000" }; }
+    constructor(id) {
+        this.id = id; this.value = ""; this.textContent = ""; this.checked = false;
+        this.style = { setProperty(name, value) { this[name] = value; } };
+        const classes = new Set(id.includes("modal") ? ["is-hidden"] : []);
+        this.classList = {
+            toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+            add(name) { classes.add(name); }, remove(name) { classes.delete(name); },
+            contains(name) { return classes.has(name); },
+        };
+        this.dataset = { min: "20", max: "20000" };
+    }
     addEventListener() {}
+    focus() { sandbox.document.activeElement = this; }
+    setAttribute(name, value) { this[name] = String(value); }
     querySelector() { return { style: {} }; }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 200, height: 120 }; }
+    setPointerCapture() {}
 }
 
 const els = {};
 for (const id of SELECT_IDS) els[id] = new Select(id);
+const documentListeners = {};
 
 const calls = [];
 const bridge = new Proxy({}, {
@@ -66,7 +78,9 @@ const sandbox = {
             return els[id];
         },
         createElement() { return new Option(); },
-        addEventListener() {},                                  // swallow DOMContentLoaded
+        addEventListener(ev, cb) {
+            (documentListeners[ev] = documentListeners[ev] || []).push(cb);
+        },
     },
     window: null,
     bridge,
@@ -101,42 +115,41 @@ check("false for a different select", W.isSelectOpen(preset) === false);
 sandbox.document.activeElement = null;
 
 // ── 2. Preset restore across two-signal arrival ────────────────────────
-section("preset restore (saved name arrives before the lists)");
-W.onSelectedPresetChanged("Footsteps - CS2");
+section("preset restore (saved id arrives before the lists)");
+W.onSelectedPresetChanged(JSON.stringify({ id: "profile:Footsteps - CS2", dirty: false }));
 check("nothing applied while both lists are empty", calls.length === 0, JSON.stringify(calls));
-W.onProfilesChanged(JSON.stringify({}));
-check("still nothing after profiles-only", calls.length === 0, JSON.stringify(calls));
 W.onPresetsChanged(JSON.stringify(
-    ["All Sounds", "Footsteps - CS2", "Footsteps - Valorant", "Custom"]));
-check("dropdown shows the saved preset", preset.value === "Footsteps - CS2", preset.value);
+    [{ id: "builtin:all-sounds", name: "All Sounds" }]));
+check("still nothing after builtins-only", calls.length === 0, JSON.stringify(calls));
+W.onProfilesChanged(JSON.stringify({ "Footsteps - CS2": { freq_low: 150 } }));
+check("dropdown shows the saved preset", preset.value === "profile:Footsteps - CS2", preset.value);
 // The restore must be SILENT. Re-applying the entry is what let a saved profile
 // overwrite the accent colour, thickness and sliders the user changed after
 // choosing it - so zero bridge traffic is the assertion that guards that fix.
 check("restore selects without applying anything", calls.length === 0, JSON.stringify(calls));
 
 // A real user pick, by contrast, both applies and persists.
-W.AR.applyPreset("Footsteps - Valorant");
-check("user pick applies", calls.some(c => c[0] === "apply_preset" && c[1] === "Footsteps - Valorant"),
+W.AR.applyPreset("builtin:all-sounds");
+check("user pick applies", calls.some(c => c[0] === "apply_preset" && c[1] === "builtin:all-sounds"),
     JSON.stringify(calls));
-check("user pick persists", calls.some(c => c[0] === "set_selected_preset" && c[1] === "Footsteps - Valorant"),
+check("user pick persists", calls.some(c => c[0] === "set_selected_preset" && c[1] === "builtin:all-sounds"),
     JSON.stringify(calls));
 
 const before = calls.length;
 W.onProfilesChanged(JSON.stringify({ "My CS2": { freq_low: 200 } }));
 check("later rebuild does not re-apply", calls.length === before, JSON.stringify(calls.slice(before)));
-check("selection survives the rebuild", preset.value === "Footsteps - CS2", preset.value);
-check("profile got the star label", preset.labels().includes("My CS2  ★"), preset.labels().join("|"));
+check("selection survives the rebuild", preset.value === "builtin:all-sounds", preset.value);
+check("profile is labelled for display", preset.labels().includes("My CS2"), preset.labels().join("|"));
 
-// ── 3. Stale saved name must not eat the selection ─────────────────────
-section("stale saved name (profile deleted since)");
-W._presetRestored = false;
-W._savedPreset = "Deleted Profile";
-preset.value = "Custom";
-W.onPresetsChanged(JSON.stringify(["All Sounds", "Footsteps - CS2", "Custom"]));
-check("keeps the current pick", preset.value === "Custom", preset.value);
+// ── 3. Stale saved id must not eat the selection ───────────────────────
+section("stale saved profile id");
+W.onSelectedPresetChanged(JSON.stringify({ id: "profile:Deleted Profile", dirty: false }));
+preset.value = "profile:My CS2";
+W.onPresetsChanged(JSON.stringify([{ id: "builtin:all-sounds", name: "All Sounds" }]));
+check("keeps the current pick", preset.value === "profile:My CS2", preset.value);
 check("never lands on a blank selection", preset.selectedIndex !== -1, String(preset.selectedIndex));
-W.onProfilesChanged(JSON.stringify({}));
-check("still keeps it after a second rebuild", preset.value === "Custom", preset.value);
+W.onProfilesChanged(JSON.stringify({ "My CS2": { freq_low: 200 } }));
+check("still keeps it after a second rebuild", preset.value === "profile:My CS2", preset.value);
 
 // ── 4. Deferral while a popup is open ──────────────────────────────────
 section("deferred fill (popup open)");
@@ -184,6 +197,121 @@ check("System default selectable via empty value", mono.selectedIndex === 0, Str
 W.onMonoStateChanged(JSON.stringify({ devices: ["Headphones", "CABLE Input"], default: "Headphones",
     cable: "CABLE Input", enabled: true, selected: "CABLE Input" }));
 check("named device selected", mono.value === "CABLE Input", mono.value);
+
+// ── 8. Dashboard text selection and context menu are disabled ─────────
+section("text selection and context menu");
+const selectEvent = {
+    defaultPrevented: false,
+    target: { closest() { return null; } },
+    preventDefault() { this.defaultPrevented = true; },
+};
+documentListeners.selectstart[0](selectEvent);
+check("text selection is prevented", selectEvent.defaultPrevented === true);
+
+const contextMenuEvent = {
+    defaultPrevented: false,
+    target: { closest() { return null; } },
+    preventDefault() { this.defaultPrevented = true; },
+};
+documentListeners.contextmenu[0](contextMenuEvent);
+check("right click is prevented", contextMenuEvent.defaultPrevented === true);
+
+const editableContextMenuEvent = {
+    defaultPrevented: false,
+    target: { closest() { return {}; } },
+    preventDefault() { this.defaultPrevented = true; },
+};
+documentListeners.contextmenu[0](editableContextMenuEvent);
+check("editable fields keep their context menu", editableContextMenuEvent.defaultPrevented === false);
+
+const editableSelectEvent = {
+    defaultPrevented: false,
+    target: { closest() { return {}; } },
+    preventDefault() { this.defaultPrevented = true; },
+};
+documentListeners.selectstart[0](editableSelectEvent);
+check("editable fields keep text selection", editableSelectEvent.defaultPrevented === false);
+
+// ── 9. Dashboard-native preset modals ─────────────────────────────────
+section("preset modals");
+const presetNameInput = sandbox.document.getElementById("preset-name-input");
+const presetNewButton = sandbox.document.getElementById("preset-new-btn");
+calls.splice(0);
+presetNameInput.value = "stale";
+presetNewButton.focus();
+W.AR.addPreset();
+check("new preset opens a modal", !els["preset-create-modal"].classList.contains("is-hidden"));
+check("new preset focuses its input", sandbox.document.activeElement === presetNameInput);
+check("new preset clears the previous value", presetNameInput.value === "", presetNameInput.value);
+
+W.AR.createPreset({ preventDefault() {} });
+check("blank name is rejected inline", /Enter a preset name/.test(els["preset-create-error"].textContent));
+check("blank name does not call the bridge", calls.length === 0, JSON.stringify(calls));
+
+W._profiles = { "Existing Name": { freq_low: 150 } };
+presetNameInput.value = " existing name ";
+W.AR.createPreset({ preventDefault() {} });
+check("case-insensitive duplicate is rejected", /already exists/.test(els["preset-create-error"].textContent));
+check("duplicate does not call the bridge", calls.length === 0, JSON.stringify(calls));
+
+presetNameInput.value = "New Preset";
+W.AR.createPreset({ preventDefault() {} });
+check("valid name saves a profile", calls.some(c => c[0] === "save_profile" &&
+    JSON.parse(c[1]).name === "New Preset"), JSON.stringify(calls));
+check("valid name selects its profile", preset.value === "profile:New Preset", preset.value);
+check("valid name closes the modal", els["preset-create-modal"].classList.contains("is-hidden"));
+
+calls.splice(0);
+preset.value = "profile:New Preset";
+W.AR.deletePreset();
+check("delete opens a confirmation modal", !els["preset-delete-modal"].classList.contains("is-hidden"));
+check("delete captures the selected name", els["preset-delete-name"].textContent === "New Preset");
+W.AR.closePresetDeleteModal();
+check("delete cancel makes no bridge call", calls.length === 0, JSON.stringify(calls));
+
+W.AR.deletePreset();
+const deleteEnterEvent = { key: "Enter", defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; } };
+documentListeners.keydown[0](deleteEnterEvent);
+check("delete Enter confirms the captured profile", calls.some(c => c[0] === "delete_profile" && c[1] === "New Preset"),
+    JSON.stringify(calls));
+check("delete Enter is consumed", deleteEnterEvent.defaultPrevented === true);
+
+// ── 10. Dashboard-native color modal ──────────────────────────────────
+section("color modal");
+calls.splice(0);
+const accentColor = sandbox.document.getElementById("accent-color");
+accentColor.dataset.color = "#9751F2";
+accentColor.focus();
+W.AR.openColorModal();
+check("color modal opens with its HEX field focused", sandbox.document.activeElement === els["color-hex-input"]);
+els["color-hex-input"].value = "#bad";
+W.AR.applyColorModal({ preventDefault() {} });
+check("invalid HEX remains inline", /six-digit HEX/.test(els["color-error"].textContent));
+check("invalid HEX makes no appearance calls", calls.length === 0, JSON.stringify(calls));
+
+W.AR.closeColorModal();
+check("color cancel makes no appearance calls", calls.length === 0, JSON.stringify(calls));
+W.AR.openColorModal();
+els["color-hex-input"].value = "aabbcc";
+W.AR.applyColorModal({ preventDefault() {} });
+check("valid color sends normalized color", calls.some(c => c[0] === "set_accent_color" && c[1] === "#AABBCC"),
+    JSON.stringify(calls));
+check("valid color commits appearance", calls.some(c => c[0] === "commit_appearance"), JSON.stringify(calls));
+
+calls.splice(0);
+W.AR.openColorModal();
+const escapeEvent = { key: "Escape", defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; } };
+documentListeners.keydown[0](escapeEvent);
+check("Escape closes the active modal", els["color-modal"].classList.contains("is-hidden"));
+check("Escape discards color changes", calls.length === 0, JSON.stringify(calls));
+check("Escape is consumed", escapeEvent.defaultPrevented === true);
+
+const html = fs.readFileSync(path.join(__dirname, "..", "dashboard_v2", "index.html"), "utf8");
+check("each new modal backdrop closes without submitting", /color-modal[\s\S]*?onclick="AR\.closeColorModal\(\)"/.test(html) &&
+    /preset-create-modal[\s\S]*?onclick="AR\.closePresetCreateModal\(\)"/.test(html) &&
+    /preset-delete-modal[\s\S]*?onclick="AR\.closePresetDeleteModal\(\)"/.test(html));
 
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

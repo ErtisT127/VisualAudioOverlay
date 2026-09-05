@@ -84,7 +84,7 @@
                                 <span class="value" id="sensitivity-val">0.0050</span>
                             </div>
                             <input type="range" class="slider" id="sensitivity" min="1" max="500" value="50"
-                                oninput="AR.setSensitivity(this.value)">
+                                oninput="AR.setSensitivity(this.value)" onchange="AR.commitAudioSettings()">
                         </div>
 
                         <div class="control">
@@ -94,7 +94,7 @@
                                 <span class="value" id="gain-val">1.0x</span>
                             </div>
                             <input type="range" class="slider" id="gain" min="10" max="500" value="10"
-                                oninput="AR.setGain(this.value)">
+                                oninput="AR.setGain(this.value)" onchange="AR.commitAudioSettings()">
                         </div>
 
                     </div>
@@ -115,9 +115,9 @@
                                 <div class="dualrange-track"></div>
                                 <div class="dualrange-fill"></div>
                                 <input type="range" class="dualrange-input" id="freq-low"
-                                    min="20" max="20000" value="150">
+                                    min="20" max="20000" value="150" onchange="AR.commitAudioSettings()">
                                 <input type="range" class="dualrange-input" id="freq-high"
-                                    min="20" max="20000" value="4000">
+                                    min="20" max="20000" value="4000" onchange="AR.commitAudioSettings()">
                             </div>
                         </div>
 
@@ -128,7 +128,7 @@
                                 <span class="value" id="max-amp-val">1.00</span>
                             </div>
                             <input type="range" class="slider" id="max-amp" min="1" max="100" value="100"
-                                oninput="AR.setMaxAmp(this.value)">
+                                oninput="AR.setMaxAmp(this.value)" onchange="AR.commitAudioSettings()">
                         </div>
                     </div>
                 </div>
@@ -167,7 +167,13 @@
                 </h2>
 
                 <div class="field">
-                    <div class="field-label"><span>Start / Stop</span></div>
+                    <div class="field-label">
+                        <span>Start / Stop</span>
+                        <button id="shortcut-trigger" class="shortcut-trigger" title="Bind shortcut"
+                            onclick="AR.openHotkeyModal()">
+                            <kbd id="shortcut-key">F8</kbd>
+                        </button>
+                    </div>
                     <button id="btn-toggle" class="btn-toggle" onclick="AR.toggleRadar()">Start</button>
                     <div id="status-text" class="device-sub">Radar stopped</div>
                 </div>
@@ -191,9 +197,9 @@
                 <div class="custom-col">
                     <h3 class="group-title">Color</h3>
                     <div class="color-block">
-                        <!-- Native color input drives the accent; styled as a swatch -->
-                        <input type="color" id="accent-color" class="color-input" value="#9751F2"
-                            oninput="AR.setAccentColor(this.value)">
+                        <button type="button" id="accent-color" class="color-input" data-color="#9751F2"
+                            title="Choose radar color" aria-label="Choose radar color"
+                            aria-haspopup="dialog" onclick="AR.openColorModal()"></button>
                         <div class="color-readout">
                             <span class="color-hex" id="color-hex">#9751F2</span>
                             <span class="color-rgb" id="color-rgb">151, 81, 242</span>
@@ -207,7 +213,7 @@
                             <span class="value" id="thickness-val">6 px</span>
                         </div>
                         <input type="range" class="slider" id="thickness" min="1" max="20" value="6"
-                            oninput="AR.setThickness(this.value)">
+                            oninput="AR.setThickness(this.value)" onchange="AR.commitAppearance()">
                     </div>
                 </div>
 
@@ -274,6 +280,86 @@
     <!-- ── Mono Output setup modal ───────────────────────────────────────
          Kept out of the cards so its multi-step content can scroll freely
          without clipping the fixed-height dashboard layout. -->
+    <div id="hotkey-modal" class="modal is-hidden" role="dialog" aria-modal="true"
+        aria-labelledby="hotkey-modal-title">
+        <div class="modal-backdrop" onclick="AR.closeHotkeyModal()"></div>
+        <div class="modal-card hotkey-modal-card">
+            <h2 id="hotkey-modal-title" class="modal-title">Bind radar shortcut</h2>
+            <button id="hotkey-capture" class="hotkey-capture" type="button" aria-pressed="false"
+                onclick="AR.beginHotkeyCapture()">
+                <kbd id="hotkey-capture-value">F8</kbd>
+                <span id="hotkey-capture-hint" class="hotkey-capture-hint"></span>
+            </button>
+            <div id="hotkey-error" class="hotkey-error" role="alert"></div>
+            <div class="hotkey-actions">
+                <button id="hotkey-clear" class="hotkey-clear" onclick="AR.clearHotkey()">Clear</button>
+                <button id="hotkey-cancel" class="btn-toggle btn-toggle--small" onclick="AR.closeHotkeyModal()">Cancel</button>
+                <button id="hotkey-save" class="btn-toggle btn-toggle--small" onclick="AR.saveHotkey()" disabled>Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="color-modal" class="modal is-hidden" role="dialog" aria-modal="true"
+        aria-labelledby="color-modal-title">
+        <div class="modal-backdrop" onclick="AR.closeColorModal()"></div>
+        <form class="modal-card color-modal-card" onsubmit="AR.applyColorModal(event)">
+            <h2 id="color-modal-title" class="modal-title">Radar Color</h2>
+            <div class="color-picker-layout">
+                <button type="button" id="color-sv-plane" class="color-sv-plane"
+                    aria-label="Saturation and brightness" onpointerdown="AR.pickColor(event)"
+                    onpointermove="AR.pickColor(event)" onkeydown="AR.nudgeColor(event)">
+                    <span id="color-sv-marker" class="color-sv-marker"></span>
+                </button>
+                <label class="modal-field-label" for="color-hue">Hue</label>
+                <input type="range" id="color-hue" class="color-hue" min="0" max="360" value="270"
+                    oninput="AR.setColorHue(this.value)">
+            </div>
+            <div class="color-compare" aria-label="Current and new color">
+                <div><span class="color-compare-label">Current</span><span id="color-original-swatch" class="color-compare-swatch"></span></div>
+                <div><span class="color-compare-label">New</span><span id="color-draft-swatch" class="color-compare-swatch"></span></div>
+            </div>
+            <label class="modal-field-label" for="color-hex-input">HEX</label>
+            <input type="text" id="color-hex-input" class="modal-text-input" maxlength="7"
+                autocomplete="off" spellcheck="false" aria-describedby="color-error"
+                oninput="AR.setColorHex(this.value)">
+            <div id="color-error" class="modal-error" role="alert"></div>
+            <div class="modal-actions">
+                <button type="button" class="modal-cancel" onclick="AR.closeColorModal()">Cancel</button>
+                <button type="submit" class="btn-toggle btn-toggle--small">Apply</button>
+            </div>
+        </form>
+    </div>
+
+    <div id="preset-create-modal" class="modal is-hidden" role="dialog" aria-modal="true"
+        aria-labelledby="preset-create-modal-title">
+        <div class="modal-backdrop" onclick="AR.closePresetCreateModal()"></div>
+        <form class="modal-card preset-modal-card" onsubmit="AR.createPreset(event)">
+            <h2 id="preset-create-modal-title" class="modal-title">New Preset</h2>
+            <label class="modal-field-label" for="preset-name-input">Preset name</label>
+            <input type="text" id="preset-name-input" class="modal-text-input" maxlength="64"
+                autocomplete="off" aria-describedby="preset-create-error">
+            <div id="preset-create-error" class="modal-error" role="alert"></div>
+            <div class="modal-actions">
+                <button type="button" class="modal-cancel" onclick="AR.closePresetCreateModal()">Cancel</button>
+                <button type="submit" class="btn-toggle btn-toggle--small">Create</button>
+            </div>
+        </form>
+    </div>
+
+    <div id="preset-delete-modal" class="modal is-hidden" role="dialog" aria-modal="true"
+        aria-labelledby="preset-delete-modal-title">
+        <div class="modal-backdrop" onclick="AR.closePresetDeleteModal()"></div>
+        <div class="modal-card preset-modal-card">
+            <h2 id="preset-delete-modal-title" class="modal-title">Delete Preset?</h2>
+            <p class="modal-intro">This permanently removes <strong id="preset-delete-name"></strong>.</p>
+            <div class="modal-actions">
+                <button type="button" class="modal-cancel" onclick="AR.closePresetDeleteModal()">Cancel</button>
+                <button type="button" id="preset-delete-confirm" class="btn-toggle btn-toggle--small modal-danger"
+                    onclick="AR.confirmPresetDelete()">Delete</button>
+            </div>
+        </div>
+    </div>
+
     <div id="mono-modal" class="modal is-hidden" role="dialog" aria-modal="true"
         aria-labelledby="mono-modal-title">
         <div class="modal-backdrop" onclick="AR.closeMonoSetup()"></div>

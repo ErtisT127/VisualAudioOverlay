@@ -37,6 +37,7 @@ import threading
 from ctypes import POINTER, byref, c_uint32, c_uint64, c_void_p, wintypes
 
 import numpy as np
+from app_logging import get_logger
 from comtypes import COMMETHOD, GUID, HRESULT, COMObject, IUnknown
 from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
 
@@ -45,6 +46,8 @@ from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
 # we *construct* and pass into Initialize gets corrupted (-> E_INVALIDARG). We
 # define a correct 18-byte WAVEFORMATEX below and cast to pycaw's pointer type.
 from pycaw.api.audioclient import IAudioClient
+
+logger = get_logger("process_loopback")
 
 
 class WAVEFORMATEX(ctypes.Structure):
@@ -234,17 +237,13 @@ _ActivateAudioInterfaceAsync.argtypes = [
 
 def is_supported() -> bool:
     """Process loopback needs Windows 10 build 20348+ (Windows 11 included)."""
-    try:
-        v = ctypes.windll.ntdll.RtlGetVersion  # most reliable build number
-    except Exception:
-        pass
-    # Fall back to GetVersionEx-style check via sys.getwindowsversion.
     import sys
 
     try:
         wv = sys.getwindowsversion()
         return wv.major > 10 or (wv.major == 10 and wv.build >= 20348)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Windows version check failed: %s", exc)
         return False
 
 
@@ -411,21 +410,21 @@ class ProcessLoopbackCapture:
         try:
             if self._client is not None:
                 self._client.Stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("audio client stop failed during cleanup: %s", exc)
         self._capture = None
         self._client = None
         if self._event:
             try:
                 _kernel32.CloseHandle(self._event)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("capture event close failed: %s", exc)
             self._event = None
         if self._com_inited:
             try:
                 _ole32.CoUninitialize()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("COM uninitialization failed: %s", exc)
             self._com_inited = False
 
 
@@ -460,7 +459,10 @@ def _sessions_all_render_devices():
                 IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None
             ).QueryInterface(IAudioSessionManager2)
             session_enum = mgr.GetSessionEnumerator()
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "audio session manager unavailable for endpoint %s: %s", i, exc
+            )
             continue  # some endpoints refuse a session manager - skip them
         for j in range(session_enum.GetCount()):
             ctl = session_enum.GetSession(j)
@@ -468,7 +470,10 @@ def _sessions_all_render_devices():
                 continue
             try:
                 ctl2 = ctl.QueryInterface(IAudioSessionControl2)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "audio session query failed endpoint=%s session=%s: %s", i, j, exc
+                )
                 continue
             if ctl2 is not None:
                 yield AudioSession(ctl2)
@@ -487,14 +492,18 @@ def list_audio_programs() -> list[dict]:
     """
     try:
         sessions = list(_sessions_all_render_devices())
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "all-endpoint audio enumeration failed; using default endpoint: %s", exc
+        )
         # Fall back to the default-device-only enumeration if the multi-device
         # scan fails for any reason, so the dropdown never goes empty.
         try:
             from pycaw.utils import AudioUtilities
 
             sessions = AudioUtilities.GetAllSessions()
-        except Exception:
+        except Exception as exc:
+            logger.error("default audio enumeration failed: %s", exc)
             return []
 
     found = {}
@@ -504,7 +513,8 @@ def list_audio_programs() -> list[dict]:
             continue  # system sounds / no owning process
         try:
             name = proc.name()
-        except Exception:
+        except Exception as exc:
+            logger.debug("audio process name lookup failed: %s", exc)
             continue
         if not name:
             continue

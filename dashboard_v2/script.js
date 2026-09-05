@@ -10,6 +10,7 @@
  *   set_freq_range(int low, int high), set_max_amplitude(float),
  *   apply_preset(str), set_monitor(int), set_accent_color(hex),
  *   set_stroke_width(int), save_profile(jsonStr), delete_profile(str),
+ *   commit_audio_settings(), commit_appearance(),
  *   request_initial_data()
  *
  *   set_program(str)            - per-app capture target
@@ -31,9 +32,29 @@
 let radarActive = false;
 let operationBusy = false;
 let operationState = "idle";
+let hotkeyState = { combo: "F8", status: "active", editing: false, registered: false, error: "" };
+let pendingHotkey = "";
+let hotkeyCapturing = false;
+let hotkeyRequestBusy = false;
+const hotkeyPressed = new Set();
 let moveModeActive = false;
 let presetState = { id: "builtin:all-sounds", dirty: false };
 let presetApplying = false;
+let activeDashboardModal = null;
+let modalReturnFocus = null;
+let colorDraft = null;
+let pendingDeletePresetName = "";
+const EDITABLE_SELECTOR = [
+    'input[type="text"]',
+    'input[type="search"]',
+    'input[type="password"]',
+    'input[type="email"]',
+    'input[type="url"]',
+    'input[type="tel"]',
+    'input[type="number"]',
+    "textarea",
+    '[contenteditable]:not([contenteditable="false"])',
+].join(", ");
 
 // Project links (opened in the real browser via bridge.open_url). The update
 // banner overrides updateUrl when a specific release page is known.
@@ -65,6 +86,7 @@ function initBridge() {
             if (bridge.selectedPresetChanged) bridge.selectedPresetChanged.connect(onSelectedPresetChanged);
             if (bridge.operationBusyChanged) bridge.operationBusyChanged.connect(onOperationBusyChanged);
             if (bridge.operationStateChanged) bridge.operationStateChanged.connect(onOperationStateChanged);
+            if (bridge.hotkeyStateChanged) bridge.hotkeyStateChanged.connect(onHotkeyStateChanged);
 
             // Show the current version in the footer.
             if (bridge.get_app_version) {
@@ -113,6 +135,155 @@ function onOperationBusyChanged(busy) {
 function onOperationStateChanged(state) {
     operationState = state || "idle";
     syncToggleUI();
+}
+
+function onHotkeyStateChanged(jsonStr) {
+    try { hotkeyState = JSON.parse(jsonStr) || hotkeyState; } catch (_) { return; }
+    const error = hotkeyState.error || "";
+    setText("hotkey-error", error);
+    renderDashboardHotkey();
+    if (!hotkeyState.editing && !error && !hotkeyRequestBusy && !modalIsHidden("hotkey-modal")) {
+        AR.closeHotkeyModal(false);
+    }
+    syncHotkeyControls();
+}
+
+function displayHotkey(combo) {
+    if (!combo) return "Set";
+    return combo.replace(/CTRL/g, "Ctrl").replace(/ALT/g, "Alt").replace(/SHIFT/g, "Shift");
+}
+
+function displayCaptureHotkey(combo) {
+    return combo ? displayHotkey(combo) : "Press keys";
+}
+
+function renderDashboardHotkey() {
+    const trigger = document.getElementById("shortcut-trigger");
+    const combo = hotkeyState.combo || "";
+    setText("shortcut-key", displayHotkey(combo));
+    if (trigger) {
+        trigger.title = hotkeyState.status === "unavailable"
+            ? "Shortcut unavailable. Click to rebind."
+            : "Bind shortcut";
+        trigger.classList.toggle("is-unavailable", hotkeyState.status === "unavailable");
+    }
+}
+
+function modalIsHidden(id) { return document.getElementById(id)?.classList.contains("is-hidden") !== false; }
+
+function syncHotkeyControls() {
+    const busy = hotkeyRequestBusy;
+    const save = document.getElementById("hotkey-save");
+    const clear = document.getElementById("hotkey-clear");
+    const cancel = document.getElementById("hotkey-cancel");
+    if (save) save.disabled = busy || !pendingHotkey;
+    if (clear) clear.disabled = busy;
+    if (cancel) cancel.disabled = busy;
+}
+
+function hotkeyKey(event) {
+    const namedKeys = {
+        " ": "SPACE", ArrowUp: "UP", ArrowDown: "DOWN", ArrowLeft: "LEFT", ArrowRight: "RIGHT",
+        Insert: "INSERT", Delete: "DELETE", Home: "HOME", End: "END", PageUp: "PAGEUP", PageDown: "PAGEDOWN",
+    };
+    if (namedKeys[event.key]) return namedKeys[event.key];
+    if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(event.key)) return event.key.toUpperCase();
+    if (/^[a-z0-9]$/i.test(event.key)) return event.key.toUpperCase();
+    return "";
+}
+
+function renderHotkeyCapture(value, hint) {
+    setText("hotkey-capture-value", value);
+    setText("hotkey-capture-hint", hint || "");
+}
+
+function resetHotkeyCaptureUI(value) {
+    pendingHotkey = "";
+    hotkeyPressed.clear();
+    const capture = document.getElementById("hotkey-capture");
+    if (capture) {
+        capture.classList.remove("is-capturing");
+        capture.setAttribute("aria-pressed", "false");
+    }
+    renderHotkeyCapture(value ?? displayCaptureHotkey(hotkeyState.combo || ""), "");
+}
+
+function pressedHotkeyModifiers(event) {
+    const modifiers = [];
+    if (event.ctrlKey || hotkeyPressed.has("Control")) modifiers.push("CTRL");
+    if (event.altKey || hotkeyPressed.has("Alt")) modifiers.push("ALT");
+    if (event.shiftKey || hotkeyPressed.has("Shift")) modifiers.push("SHIFT");
+    return modifiers;
+}
+
+function renderPressedModifiers() {
+    const modifiers = [];
+    if (hotkeyPressed.has("Control")) modifiers.push("CTRL");
+    if (hotkeyPressed.has("Alt")) modifiers.push("ALT");
+    if (hotkeyPressed.has("Shift")) modifiers.push("SHIFT");
+    renderHotkeyCapture(
+        modifiers.length ? displayHotkey(modifiers.join("+")) + " +" : "Press keys",
+        ""
+    );
+}
+
+function captureHotkey(event) {
+    const modal = document.getElementById("hotkey-modal");
+    if (!modal || modal.classList.contains("is-hidden")) return;
+    if (event.key === "Escape") {
+        event.preventDefault();
+        AR.closeHotkeyModal();
+        return;
+    }
+    if (!hotkeyCapturing) return;
+    event.preventDefault();
+    if (pendingHotkey) return;
+    if (event.metaKey) {
+        setText("hotkey-error", "Windows key combinations are not supported.");
+        renderHotkeyCapture("Win", "Press a supported key");
+        return;
+    }
+    if (event.repeat) return;
+    hotkeyPressed.add(event.key);
+    const modifiers = pressedHotkeyModifiers(event);
+    const key = hotkeyKey(event);
+    if (!key) {
+        renderHotkeyCapture(
+            modifiers.length ? displayHotkey(modifiers.join("+")) + " +" : "Press keys",
+            ""
+        );
+        return;
+    }
+
+    pendingHotkey = [...modifiers, key].join("+");
+    const needsPrimaryModifier = /^[A-Z0-9]$/.test(key) || key === "SPACE";
+    if (needsPrimaryModifier && !modifiers.some(modifier => modifier === "CTRL" || modifier === "ALT")) {
+        pendingHotkey = "";
+        renderHotkeyCapture("Press keys", "");
+        setText("hotkey-error", "Letters, numbers, and Space need Ctrl or Alt.");
+        return;
+    }
+    renderHotkeyCapture(displayHotkey(pendingHotkey), "");
+    setText("hotkey-error", "");
+    const save = document.getElementById("hotkey-save");
+    if (save) save.disabled = false;
+}
+
+function releaseHotkey(event) {
+    const modal = document.getElementById("hotkey-modal");
+    if (!modal || modal.classList.contains("is-hidden") || !hotkeyCapturing) return;
+    // Some Chromium layouts report left/right modifier names differently. Use
+    // the modifier flags as the authoritative release state, then clear any
+    // aliases left in the pressed set.
+    if (!event.ctrlKey) hotkeyPressed.delete("Control");
+    if (!event.altKey) hotkeyPressed.delete("Alt");
+    if (!event.shiftKey) hotkeyPressed.delete("Shift");
+    if (!pendingHotkey) renderPressedModifiers();
+}
+
+function clearPressedHotkeys() {
+    hotkeyPressed.clear();
+    if (hotkeyCapturing && !pendingHotkey) renderHotkeyCapture("Press keys", "");
 }
 
 function onDeviceChanged(label) {
@@ -171,13 +342,11 @@ function onProgramsChanged(jsonStr) {
 }
 
 // Saved overlay appearance (accent colour + thickness) restored from settings.json.
-// Setting an input's value programmatically does NOT fire its oninput, so this never
-// loops back into a re-save.
+// Applying it locally never calls the bridge, so this does not loop into a re-save.
 function onAppearanceChanged(jsonStr) {
     const a = JSON.parse(jsonStr);
     if (a.color) {
-        const ac = document.getElementById("accent-color");
-        if (ac) ac.value = a.color;
+        setAccentSwatch(a.color);
         updateColorReadout(a.color);
     }
     if (a.thickness != null) {
@@ -304,7 +473,13 @@ function markPresetDirty() {
     presetState.dirty = baseline ? !audioValuesEqual(currentAudioValues(), baseline) : true;
     rebuildPresetSelects();
     syncPresetButtons();
-    if (bridge.set_preset_state) bridge.set_preset_state(JSON.stringify(presetState));
+    persistPresetState();
+}
+
+function persistPresetState() {
+    if (bridge.set_preset_state) {
+        bridge.set_preset_state(JSON.stringify(presetState));
+    }
 }
 
 function currentAudioValues() {
@@ -378,6 +553,88 @@ function profileData(name) {
     };
 }
 
+function openDashboardModal(id, focusId) {
+    const modal = document.getElementById(id);
+    if (!modal) return;
+    modalReturnFocus = document.activeElement?.focus ? document.activeElement : null;
+    activeDashboardModal = id;
+    toggleClass(id, "is-hidden", false);
+    document.getElementById(focusId)?.focus();
+}
+
+function closeDashboardModal(id) {
+    toggleClass(id, "is-hidden", true);
+    if (activeDashboardModal !== id) return;
+    activeDashboardModal = null;
+    const returnFocus = modalReturnFocus;
+    modalReturnFocus = null;
+    returnFocus?.focus();
+}
+
+function normalizeHex(value) {
+    const hex = String(value || "").trim();
+    const normalized = hex.startsWith("#") ? hex : `#${hex}`;
+    return /^#[0-9a-fA-F]{6}$/.test(normalized) ? normalized.toUpperCase() : null;
+}
+
+function hexToHsv(hex) {
+    const value = normalizeHex(hex) || "#9751F2";
+    const rgb = [1, 3, 5].map(offset => parseInt(value.slice(offset, offset + 2), 16) / 255);
+    const max = Math.max(...rgb);
+    const min = Math.min(...rgb);
+    const delta = max - min;
+    let hue = 0;
+    if (delta) {
+        if (max === rgb[0]) hue = 60 * (((rgb[1] - rgb[2]) / delta) % 6);
+        else if (max === rgb[1]) hue = 60 * ((rgb[2] - rgb[0]) / delta + 2);
+        else hue = 60 * ((rgb[0] - rgb[1]) / delta + 4);
+    }
+    return { h: (hue + 360) % 360, s: max ? delta / max : 0, v: max };
+}
+
+function hsvToHex(h, s, v) {
+    const chroma = v * s;
+    const second = chroma * (1 - Math.abs((h / 60) % 2 - 1));
+    const match = v - chroma;
+    const channels = h < 60 ? [chroma, second, 0] : h < 120 ? [second, chroma, 0] :
+        h < 180 ? [0, chroma, second] : h < 240 ? [0, second, chroma] :
+            h < 300 ? [second, 0, chroma] : [chroma, 0, second];
+    return "#" + channels.map(channel => Math.round((channel + match) * 255)
+        .toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+function renderColorDraft() {
+    if (!colorDraft) return;
+    const hex = hsvToHex(colorDraft.h, colorDraft.s, colorDraft.v);
+    const plane = document.getElementById("color-sv-plane");
+    if (plane) plane.style.setProperty("--hue-color", hsvToHex(colorDraft.h, 1, 1));
+    const marker = document.getElementById("color-sv-marker");
+    if (marker) {
+        marker.style.left = `${colorDraft.s * 100}%`;
+        marker.style.top = `${(1 - colorDraft.v) * 100}%`;
+    }
+    const hue = document.getElementById("color-hue");
+    if (hue) hue.value = String(Math.round(colorDraft.h));
+    const input = document.getElementById("color-hex-input");
+    if (input) input.value = hex;
+    const draft = document.getElementById("color-draft-swatch");
+    if (draft) draft.style.background = hex;
+}
+
+function setAccentSwatch(hex) {
+    const swatch = document.getElementById("accent-color");
+    const normalized = normalizeHex(hex);
+    if (!swatch || !normalized) return;
+    swatch.dataset.color = normalized;
+    swatch.style.background = normalized;
+}
+
+function presetNameExists(name) {
+    const normalized = name.trim().toLowerCase();
+    return Object.keys(window._profiles || {}).some(existing =>
+        existing.trim().toLowerCase() === normalized);
+}
+
 // ── AR namespace (JS → Python) ─────────────────────────────────────────
 window.AR = {
     toggleRadar() {
@@ -411,6 +668,96 @@ window.AR = {
         markPresetDirty();
     },
 
+    openHotkeyModal() {
+        if (hotkeyRequestBusy || !bridge?.begin_hotkey_edit) return;
+        resetHotkeyCaptureUI(displayCaptureHotkey(hotkeyState.combo || ""));
+        hotkeyCapturing = false;
+        setText("hotkey-error", "");
+        hotkeyRequestBusy = true;
+        syncHotkeyControls();
+        bridge.begin_hotkey_edit((json) => {
+            hotkeyRequestBusy = false;
+            onHotkeyStateChanged(json);
+            if (hotkeyState.editing) {
+                renderHotkeyCapture(displayCaptureHotkey(hotkeyState.combo), "");
+                toggleClass("hotkey-modal", "is-hidden", false);
+                const capture = document.getElementById("hotkey-capture");
+                if (capture) {
+                    capture.classList.remove("is-capturing");
+                    capture.setAttribute("aria-pressed", "false");
+                }
+            }
+            syncHotkeyControls();
+        });
+    },
+
+    closeHotkeyModal(cancel = true) {
+        hotkeyCapturing = false;
+        resetHotkeyCaptureUI(displayCaptureHotkey(hotkeyState.combo || ""));
+        setText("hotkey-error", "");
+        if (!cancel || !hotkeyState.editing || !bridge?.cancel_hotkey_edit) {
+            toggleClass("hotkey-modal", "is-hidden", true);
+            return;
+        }
+        if (hotkeyRequestBusy) return;
+        hotkeyRequestBusy = true;
+        syncHotkeyControls();
+        bridge.cancel_hotkey_edit((json) => {
+            hotkeyRequestBusy = false;
+            onHotkeyStateChanged(json);
+            toggleClass("hotkey-modal", "is-hidden", true);
+            syncHotkeyControls();
+        });
+    },
+
+    beginHotkeyCapture() {
+        hotkeyCapturing = true;
+        resetHotkeyCaptureUI("Press keys");
+        setText("hotkey-error", "");
+        const save = document.getElementById("hotkey-save");
+        if (save) save.disabled = true;
+        const capture = document.getElementById("hotkey-capture");
+        if (capture) {
+            capture.classList.add("is-capturing");
+            capture.setAttribute("aria-pressed", "true");
+            capture.focus();
+        }
+    },
+
+    saveHotkey() {
+        if (!pendingHotkey || hotkeyRequestBusy || !bridge?.commit_hotkey) return;
+        hotkeyRequestBusy = true;
+        syncHotkeyControls();
+        bridge.commit_hotkey(pendingHotkey, (json) => {
+            hotkeyRequestBusy = false;
+            onHotkeyStateChanged(json);
+            if (!hotkeyState.editing && !hotkeyState.error) {
+                hotkeyCapturing = false;
+                resetHotkeyCaptureUI(displayCaptureHotkey(hotkeyState.combo || ""));
+                toggleClass("hotkey-modal", "is-hidden", true);
+            }
+            syncHotkeyControls();
+        });
+    },
+
+    clearHotkey() {
+        if (hotkeyRequestBusy || !bridge?.clear_hotkey) return;
+        hotkeyRequestBusy = true;
+        syncHotkeyControls();
+        bridge.clear_hotkey((json) => {
+            hotkeyRequestBusy = false;
+            onHotkeyStateChanged(json);
+            hotkeyCapturing = false;
+            resetHotkeyCaptureUI(displayCaptureHotkey(hotkeyState.combo || ""));
+            toggleClass("hotkey-modal", "is-hidden", true);
+            syncHotkeyControls();
+        });
+    },
+
+    commitAudioSettings() {
+        if (bridge.commit_audio_settings) bridge.commit_audio_settings();
+    },
+
     // Frequency is in real Hz (locked decision). Dual handles.
     setFreqRange() {
         const lowEl = document.getElementById("freq-low");
@@ -437,25 +784,54 @@ window.AR = {
             presetApplying = true;
             applyProfileValues(profiles[profileName]);
             presetApplying = false;
+            // Persist the complete profile once its live values are applied.
+            AR.commitAudioSettings();
         } else {
             presetApplying = true;
             bridge.apply_preset(name);
             presetApplying = false;
         }
         presetState = { id: name, dirty: false };
+        persistPresetState();
         if (bridge.set_selected_preset) bridge.set_selected_preset(name);
         rebuildPresetSelects();
         syncPresetButtons();
     },
 
     addPreset() {
-        const name = (window.prompt("New preset name") || "").trim();
-        if (!name) return;
-        bridge.save_profile(JSON.stringify(profileData(name)));
+        const input = document.getElementById("preset-name-input");
+        if (input) input.value = "";
+        setText("preset-create-error", "");
+        openDashboardModal("preset-create-modal", "preset-name-input");
+    },
+
+    closePresetCreateModal() {
+        closeDashboardModal("preset-create-modal");
+    },
+
+    createPreset(event) {
+        event?.preventDefault();
+        const input = document.getElementById("preset-name-input");
+        const name = input?.value.trim() || "";
+        if (!name) {
+            setText("preset-create-error", "Enter a preset name.");
+            input?.focus();
+            return;
+        }
+        if (presetNameExists(name)) {
+            setText("preset-create-error", "A preset with this name already exists.");
+            input?.focus();
+            return;
+        }
+        const profile = profileData(name);
+        bridge.save_profile(JSON.stringify(profile));
+        window._profiles = { ...(window._profiles || {}), [name]: profile };
         presetState = { id: `profile:${name}`, dirty: false };
+        persistPresetState();
         if (bridge.set_selected_preset) bridge.set_selected_preset(presetState.id);
         rebuildPresetSelects();
         syncPresetButtons();
+        closeDashboardModal("preset-create-modal");
     },
 
     resetPreset() {
@@ -469,6 +845,7 @@ window.AR = {
         const name = presetState.id.slice(8);
         bridge.save_profile(JSON.stringify(profileData(name)));
         presetState = { id: `profile:${name}`, dirty: false };
+        persistPresetState();
         if (bridge.set_selected_preset) bridge.set_selected_preset(presetState.id);
         rebuildPresetSelects();
         syncPresetButtons();
@@ -480,12 +857,21 @@ window.AR = {
         if (!id || !id.startsWith("profile:")) return;
         const name = id.slice(8);
         if (!name) return;
-        if (!(window._profiles || {})[name]) {
-            window.alert("Built-in presets can't be deleted - only saved presets (★).");
-            return;
-        }
-        if (!window.confirm(`Delete preset \"${name}\"?`)) return;
-        bridge.delete_profile(name);
+        if (!(window._profiles || {})[name]) return;
+        pendingDeletePresetName = name;
+        setText("preset-delete-name", name);
+        openDashboardModal("preset-delete-modal", "preset-delete-confirm");
+    },
+
+    closePresetDeleteModal() {
+        pendingDeletePresetName = "";
+        closeDashboardModal("preset-delete-modal");
+    },
+
+    confirmPresetDelete() {
+        if (!pendingDeletePresetName) return;
+        bridge.delete_profile(pendingDeletePresetName);
+        AR.closePresetDeleteModal();
     },
 
     setMonitor(idx) { bridge.set_monitor(parseInt(idx)); },
@@ -533,8 +919,76 @@ window.AR = {
 
     setAccentColor(hex) {
         bridge.set_accent_color(hex);
+        setAccentSwatch(hex);
         updateColorReadout(hex);
         drawPreview();
+    },
+
+    openColorModal() {
+        const current = normalizeHex(document.getElementById("accent-color")?.dataset.color) || "#9751F2";
+        colorDraft = { ...hexToHsv(current), original: current };
+        setText("color-error", "");
+        const original = document.getElementById("color-original-swatch");
+        if (original) original.style.background = current;
+        renderColorDraft();
+        openDashboardModal("color-modal", "color-hex-input");
+    },
+
+    closeColorModal() {
+        colorDraft = null;
+        closeDashboardModal("color-modal");
+    },
+
+    pickColor(event) {
+        if (!colorDraft || (event.type === "pointermove" && event.buttons === 0)) return;
+        const plane = document.getElementById("color-sv-plane");
+        if (!plane) return;
+        if (event.type === "pointerdown") plane.setPointerCapture?.(event.pointerId);
+        const rect = plane.getBoundingClientRect();
+        colorDraft.s = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        colorDraft.v = Math.max(0, Math.min(1, 1 - (event.clientY - rect.top) / rect.height));
+        setText("color-error", "");
+        renderColorDraft();
+    },
+
+    nudgeColor(event) {
+        if (!colorDraft || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        const step = 0.02;
+        if (event.key === "ArrowLeft") colorDraft.s = Math.max(0, colorDraft.s - step);
+        if (event.key === "ArrowRight") colorDraft.s = Math.min(1, colorDraft.s + step);
+        if (event.key === "ArrowDown") colorDraft.v = Math.max(0, colorDraft.v - step);
+        if (event.key === "ArrowUp") colorDraft.v = Math.min(1, colorDraft.v + step);
+        setText("color-error", "");
+        renderColorDraft();
+    },
+
+    setColorHue(value) {
+        if (!colorDraft) return;
+        colorDraft.h = Math.max(0, Math.min(360, Number(value))) % 360;
+        setText("color-error", "");
+        renderColorDraft();
+    },
+
+    setColorHex(value) {
+        const hex = normalizeHex(value);
+        if (!hex || !colorDraft) return;
+        Object.assign(colorDraft, hexToHsv(hex));
+        setText("color-error", "");
+        renderColorDraft();
+    },
+
+    applyColorModal(event) {
+        event?.preventDefault();
+        const hex = normalizeHex(document.getElementById("color-hex-input")?.value);
+        if (!hex) {
+            setText("color-error", "Enter a six-digit HEX color, for example #9751F2.");
+            document.getElementById("color-hex-input")?.focus();
+            return;
+        }
+        AR.setAccentColor(hex);
+        AR.commitAppearance();
+        AR.closeColorModal();
     },
 
     setThickness(val) {
@@ -542,6 +996,10 @@ window.AR = {
         setFill("thickness", val, 1, 20);
         bridge.set_stroke_width(parseInt(val));
         drawPreview();
+    },
+
+    commitAppearance() {
+        if (bridge.commit_appearance) bridge.commit_appearance();
     },
 
     // ── Update banner ─────────────────────────────────────────────────
@@ -587,7 +1045,7 @@ function drawPreview() {
     ctx.stroke();
 
     // Sample blip arc
-    const accent = document.getElementById("accent-color")?.value || "#9751F2";
+    const accent = document.getElementById("accent-color")?.dataset.color || "#9751F2";
     const thickness = parseInt(document.getElementById("thickness")?.value || 6);
     const sampleAngleDeg = -35;             // up-and-to-the-right, like the mockup
     const spanDeg = 35;
@@ -738,9 +1196,10 @@ function syncToggleUI() {
     const dot = document.getElementById("status-dot");
     if (btn) {
         if (operationState === "starting") btn.textContent = "Starting...";
-        else if (operationState === "stopping") btn.textContent = "Stopping...";
+        else if (operationState === "restarting") btn.textContent = "Restarting...";
+        else if (operationState === "stopping" || operationState === "closing") btn.textContent = "Stopping...";
         else btn.textContent = radarActive ? "End" : "Start";
-        btn.classList.toggle("is-active", radarActive && operationState === "idle");
+        btn.classList.toggle("is-active", radarActive && operationState === "running");
         btn.disabled = operationBusy;
     }
     if (dot) {
@@ -756,6 +1215,31 @@ function syncMoveUI() {
     btn.classList.toggle("is-active", moveModeActive);
 }
 
+function isEditableTarget(target) {
+    return Boolean(target?.closest?.(EDITABLE_SELECTOR));
+}
+
+document.addEventListener("keydown", event => {
+    if (!activeDashboardModal) return;
+    if (event.key === "Escape") {
+        event.preventDefault();
+        if (activeDashboardModal === "color-modal") AR.closeColorModal();
+        if (activeDashboardModal === "preset-create-modal") AR.closePresetCreateModal();
+        if (activeDashboardModal === "preset-delete-modal") AR.closePresetDeleteModal();
+    } else if (event.key === "Enter" && activeDashboardModal === "preset-delete-modal") {
+        event.preventDefault();
+        AR.confirmPresetDelete();
+    }
+});
+
+document.addEventListener("selectstart", event => {
+    if (!isEditableTarget(event.target)) event.preventDefault();
+});
+
+document.addEventListener("contextmenu", event => {
+    if (!isEditableTarget(event.target)) event.preventDefault();
+});
+
 // ── Bootstrap ──────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", function () {
     // Default program option until/unless backend sends a list
@@ -764,6 +1248,12 @@ document.addEventListener("DOMContentLoaded", function () {
     // Wire dual-range inputs
     ["freq-low", "freq-high"].forEach(id =>
         document.getElementById(id).addEventListener("input", AR.setFreqRange));
+    document.addEventListener("keydown", captureHotkey, true);
+    document.addEventListener("keyup", releaseHotkey, true);
+    window.addEventListener("blur", clearPressedHotkeys);
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) clearPressedHotkeys();
+    });
 
     // Initial paint of values/fills/preview
     AR_initLocal();
@@ -783,7 +1273,9 @@ function AR_initLocal() {
     syncMoveUI();
     updateDualFill();
     setText("freq-val", "150-4000 Hz");
+    setAccentSwatch("#9751F2");
     updateColorReadout("#9751F2");
+    renderDashboardHotkey();
     drawPreview();
     syncPresetButtons();
 }

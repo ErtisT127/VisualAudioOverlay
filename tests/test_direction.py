@@ -1,7 +1,7 @@
 """Unit tests for direction.py - the pure math behind the radar.
 
 These run without any audio hardware, Qt, or Windows APIs (plain numpy), so
-they work in CI on Linux.
+they stay fast and deterministic in CI.
 """
 
 import math
@@ -12,7 +12,7 @@ import pytest
 from direction import angle_diff, band_rms, stereo_angle, surround_angle
 
 SR = 48000
-N = 2400  # one 50ms capture chunk, same as audio_capture.py
+N = 960  # one 20ms capture chunk, same as audio_capture.py
 
 
 def sine(freq, amp=1.0, n=N, sr=SR):
@@ -44,11 +44,13 @@ def test_out_of_band_sine_is_rejected():
 
 
 def test_band_separates_mixed_signal():
-    # Footstep-band tone + loud out-of-band rumble: the band RMS should see
-    # (approximately) only the in-band component.
+    # Footstep-band tone plus loud, well-separated high-frequency sound: the
+    # band RMS should reflect the tone rather than the out-of-band component.
+    # A 20ms analysis window has 50Hz FFT bins, so testing a 40Hz signal just
+    # below a 100Hz cutoff would assert away normal spectral leakage.
     in_band = sine(300, amp=0.2)
-    rumble = sine(40, amp=1.0)
-    data = (in_band + rumble)[:, None]
+    high_frequency = sine(4000, amp=1.0)
+    data = (in_band + high_frequency)[:, None]
     rms = band_rms(data, SR, 100, 900)
     assert rms[0] == pytest.approx(0.2 / math.sqrt(2), rel=0.1)
 
@@ -57,6 +59,13 @@ def test_per_channel_independence():
     data = np.stack([sine(300, amp=0.4), sine(4000, amp=0.4)], axis=1)
     rms = band_rms(data, SR, 100, 900)
     assert rms[0] > 10 * rms[1]
+
+
+def test_empty_and_silent_chunks_are_silent():
+    # Device reconnects can produce an empty chunk; silence must not invent a
+    # level or make the FFT path raise before the capture thread can continue.
+    assert np.array_equal(band_rms(np.empty((0, 2)), SR, 100, 900), [0.0, 0.0])
+    assert np.array_equal(band_rms(np.zeros(N), SR, 100, 900), [0.0])
 
 
 # ── stereo_angle ───────────────────────────────────────────────────────
@@ -75,6 +84,16 @@ def test_stereo_slight_pan_is_expanded():
     # The 0.3 exponent should push a mild 60/40 imbalance well off centre.
     angle = stereo_angle(0.4, 0.6)
     assert 30.0 < angle < 90.0
+
+
+def test_stereo_direction_is_independent_of_volume():
+    # Capture gain may change, but a source's left/right balance must remain
+    # at the same radar angle.
+    assert stereo_angle(0.2, 0.5) == pytest.approx(stereo_angle(2.0, 5.0))
+
+
+def test_silent_stereo_stays_centered():
+    assert stereo_angle(0.0, 0.0) == pytest.approx(0.0)
 
 
 # ── surround_angle ─────────────────────────────────────────────────────

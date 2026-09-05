@@ -29,6 +29,9 @@ import queue
 import numpy as np
 import soundcard as sc
 from PyQt6.QtCore import QThread, pyqtSignal
+from app_logging import get_logger
+
+logger = get_logger("mono_output")
 
 # Substrings that identify a virtual-audio-cable playback endpoint. VB-CABLE is
 # the one we bundle/recommend; Voicemeeter users have an equivalent sink.
@@ -39,14 +42,16 @@ def list_output_devices() -> list[str]:
     """Names of available playback devices, for the mono-output picker."""
     try:
         return [s.name for s in sc.all_speakers()]
-    except Exception:
+    except Exception as exc:
+        logger.warning("output device enumeration failed: %s", exc)
         return []
 
 
 def default_output_name() -> str | None:
     try:
         return sc.default_speaker().name
-    except Exception:
+    except Exception as exc:
+        logger.warning("default output lookup failed: %s", exc)
         return None
 
 
@@ -111,14 +116,15 @@ class MonoMixThread(QThread):
                 spk = sc.get_speaker(self.device_name)
                 if spk is not None:
                     return spk
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("selected mono speaker unavailable: %s", exc)
         return sc.default_speaker()
 
     def run(self):
         try:
             speaker = self._resolve_speaker()
             if speaker is None:
+                logger.error("mono playback unavailable: no output device")
                 self.failed.emit("no output device for mono playback")
                 return
             with speaker.player(
@@ -130,8 +136,9 @@ class MonoMixThread(QThread):
                     except queue.Empty:
                         continue
                     player.play(self._to_mono(chunk))
-        except Exception as e:
-            self.failed.emit(str(e))
+        except Exception as exc:
+            logger.exception("mono playback failed")
+            self.failed.emit(str(exc))
 
     def _to_mono(self, data: np.ndarray) -> np.ndarray:
         """Average every captured channel into one mono signal, then duplicate it

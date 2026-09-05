@@ -2,6 +2,13 @@
 
 Visual Audio Overlay uses the following third-party components.
 
+## Lucide Icons
+
+The Save and Rotate_Ccw interface icons are adapted from Lucide.
+
+- Origin: https://lucide.dev/
+- License: ISC
+
 ## VB-CABLE (VB-Audio Virtual Cable)
 
 The **Mono Output** feature uses VB-CABLE, a virtual audio device, to route a
