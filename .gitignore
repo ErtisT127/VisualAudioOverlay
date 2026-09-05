@@ -23,6 +23,7 @@ node_modules/
 # Application and native build output
 dist/
 build/
+.nuitka-cache/
 native/**/build*/
 native/**/*.dll*
 native/**/*.lib

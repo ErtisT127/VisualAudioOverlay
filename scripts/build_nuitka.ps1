@@ -30,7 +30,7 @@ if ($env:VIRTUAL_ENV) {
     $python = $null
     $uvPrefix = @("uv", "run", "--no-sync", "python")
 } else {
-    throw "No Python found. Install uv and run `uv sync --group build` first."
+    throw "No Python found. Install uv and run 'uv sync --group build' first."
 }
 
 if ($python) {
@@ -41,11 +41,11 @@ if ($python) {
 
 $soundcardOutput = & $interp -c "import os, soundcard; print(os.path.dirname(soundcard.__file__))"
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not locate the installed soundcard package. Run `uv sync --group build` first."
+    throw "Could not locate the installed soundcard package. Run 'uv sync --group build' first."
 }
 $soundcardDirectory = ($soundcardOutput -join "`n").Trim()
 if ([string]::IsNullOrWhiteSpace($soundcardDirectory)) {
-    throw "Could not locate the installed soundcard package. Run `uv sync --group build` first."
+    throw "Could not locate the installed soundcard package. Run 'uv sync --group build' first."
 }
 
 $soundcardHeader = Join-Path $soundcardDirectory "mediafoundation.py.h"
@@ -62,7 +62,7 @@ $nativeDll = Get-Item -LiteralPath ($nativeDllPath | Select-Object -Last 1)
 
 $qtWebEngineLocale = & $interp -c "import os, PyQt6; print(os.path.join(os.path.dirname(PyQt6.__file__), 'Qt6', 'translations', 'qtwebengine_locales', 'en-US.pak'))"
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not locate the PyQt6 QtWebEngine locale package. Run `uv sync --group build` first."
+    throw "Could not locate the PyQt6 QtWebEngine locale package. Run 'uv sync --group build' first."
 }
 $qtWebEngineLocale = ($qtWebEngineLocale -join "`n").Trim()
 if ([string]::IsNullOrWhiteSpace($qtWebEngineLocale) -or -not (Test-Path -LiteralPath $qtWebEngineLocale -PathType Leaf)) {
@@ -70,6 +70,8 @@ if ([string]::IsNullOrWhiteSpace($qtWebEngineLocale) -or -not (Test-Path -Litera
 }
 
 $nuitkaArguments = @(
+    # Allow Nuitka to fetch the Dependency Walker tool onefile needs on Windows.
+    "--assume-yes-for-downloads"
     "--include-data-files=$soundcardHeader=soundcard/mediafoundation.py.h"
     "--include-data-files=$qtWebEngineLocale=qtwebengine_locales/en-US.pak"
     "--include-data-files=$($nativeDll.FullName)=native/overlay_native.dll"

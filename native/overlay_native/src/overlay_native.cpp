@@ -16,10 +16,10 @@
 #endif
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -144,13 +144,13 @@ class Overlay {
             }
             drag_enabled_ = enabled;
             dragging_ = false;
-            LONG_PTR ex_style = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+            ULONG_PTR ex_style = static_cast<ULONG_PTR>(GetWindowLongPtrW(hwnd_, GWL_EXSTYLE));
             if (enabled) {
-                ex_style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+                ex_style &= ~static_cast<ULONG_PTR>(WS_EX_TRANSPARENT);
             } else {
-                ex_style |= static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+                ex_style |= static_cast<ULONG_PTR>(WS_EX_TRANSPARENT);
             }
-            SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex_style);
+            SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, static_cast<LONG_PTR>(ex_style));
             EnableWindow(hwnd_, enabled ? TRUE : FALSE);
             SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
@@ -471,7 +471,8 @@ class Overlay {
         if (!merged) {
             blips_.push_back(Blip{audio->angle, life});
             if (blips_.size() > kMaxBlips)
-                blips_.erase(blips_.begin(), blips_.begin() + (blips_.size() - kMaxBlips));
+                blips_.erase(blips_.begin(), blips_.begin() + static_cast<std::ptrdiff_t>(
+                                                                  blips_.size() - kMaxBlips));
         }
         dirty_ = true;
         // Decay is an independent 30 ms clock. Do not postpone it on every
@@ -608,9 +609,9 @@ class Overlay {
         ComPtr<ID2D1GeometrySink> sink;
         if (FAILED(geometry->Open(&sink)))
             return false;
-        const float cx = width_ * 0.5f;
-        const float cy = height_ * 0.5f;
-        const float radius = std::min(width_, height_) * 0.4f;
+        const float cx = static_cast<float>(width_) * 0.5f;
+        const float cy = static_cast<float>(height_) * 0.5f;
+        const float radius = static_cast<float>(std::min(width_, height_)) * 0.4f;
         const float start = (90.0f - blip.angle - kArcSpan * 0.5f) * 3.1415926535f / 180.0f;
         const float end = (90.0f - blip.angle + kArcSpan * 0.5f) * 3.1415926535f / 180.0f;
         auto point = [cx, cy, radius](float angle) {
@@ -638,9 +639,9 @@ class Overlay {
         // make translucent strokes look either washed out or fully opaque.
         d2d_context_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
         d2d_context_->Clear(D2D1::ColorF(0, 0.0f));
-        const float cx = width_ * 0.5f;
-        const float cy = height_ * 0.5f;
-        const float radius = std::min(width_, height_) * 0.4f;
+        const float cx = static_cast<float>(width_) * 0.5f;
+        const float cy = static_cast<float>(height_) * 0.5f;
+        const float radius = static_cast<float>(std::min(width_, height_)) * 0.4f;
         if (drag_enabled_) {
             // Layered/composited windows need a non-zero alpha surface to be
             // reliably hit-testable.  This mirrors OverlayRadar.paintEvent's
@@ -653,8 +654,9 @@ class Overlay {
                 drag_background.Get());
         }
         ComPtr<ID2D1SolidColorBrush> brush;
-        auto color = D2D1::ColorF((color_ >> 24 & 0xff) / 255.0f, (color_ >> 16 & 0xff) / 255.0f,
-                                  (color_ >> 8 & 0xff) / 255.0f, 1.0f);
+        auto color = D2D1::ColorF(static_cast<float>(color_ >> 24u & 0xffu) / 255.0f,
+                                  static_cast<float>(color_ >> 16u & 0xffu) / 255.0f,
+                                  static_cast<float>(color_ >> 8u & 0xffu) / 255.0f, 1.0f);
         d2d_context_->CreateSolidColorBrush(color, &brush);
         ComPtr<ID2D1SolidColorBrush> base;
         d2d_context_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 30.0f / 255.0f), &base);

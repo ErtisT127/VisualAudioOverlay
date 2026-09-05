@@ -59,6 +59,8 @@ if [[ ! -f "$qtwebengine_locale" ]]; then
 fi
 
 nuitka_arguments=(
+    # Allow Nuitka to fetch the Dependency Walker tool onefile needs on Windows.
+    "--assume-yes-for-downloads"
     "--include-data-files=$soundcard_header=soundcard/mediafoundation.py.h"
     "--include-data-files=$qtwebengine_locale=qtwebengine_locales/en-US.pak"
     "--include-data-files=$native_dll=native/overlay_native.dll"
