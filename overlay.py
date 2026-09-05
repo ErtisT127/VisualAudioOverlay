@@ -1,13 +1,18 @@
 import ctypes
+import os
+import time
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import QWidget
 
+from app_logging import LOG_DEBUG_ENV
 from direction import angle_diff
 
 
 class OverlayRadar(QWidget):
+    _MAX_BLIPS = 64
+
     positionChanged = pyqtSignal(int, int)  # committed position (persist to disk)
     positionPreview = pyqtSignal(int, int)  # live drag frames (UI readout only)
 
@@ -41,6 +46,14 @@ class OverlayRadar(QWidget):
         self._setup_pen.setWidth(1)
         self._setup_pen.setStyle(Qt.PenStyle.DashLine)
         self._pen_cache = {}
+        self._metrics_enabled = os.environ.get(LOG_DEBUG_ENV) == "1"
+        self._performance_metrics = {
+            "audio_updates": 0,
+            "paint_count": 0,
+            "paint_total_ms": 0.0,
+            "paint_max_ms": 0.0,
+            "max_blips": 0,
+        }
 
         # Started/stopped with visibility (show/hideEvent) so the 30ms repaint
         # tick doesn't keep running while the overlay is hidden.
@@ -112,15 +125,17 @@ class OverlayRadar(QWidget):
             ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
                 hwnd, ctypes.byref(MARGINS(0, 0, 0, 0))
             )
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - DWM integration is optional.
             pass
 
     def set_accent_color(self, hex_color):
         self.accent_color = QColor(hex_color)
+        self._pen_cache.clear()
         self.update()
 
     def set_stroke_width(self, width):
         self.stroke_width = width
+        self._pen_cache.clear()
         self.update()
 
     def mousePressEvent(self, event):
@@ -174,6 +189,8 @@ class OverlayRadar(QWidget):
             self.decay_timer.stop()
 
     def update_audio_data(self, angle, intensity):
+        if self._metrics_enabled:
+            self._performance_metrics["audio_updates"] += 1
         visual_gain = 5.0
         clamped_intensity = min(1.0, intensity * visual_gain)
 
@@ -188,9 +205,18 @@ class OverlayRadar(QWidget):
 
         if not found:
             self.blips.append({"angle": angle, "life": clamped_intensity})
+            if len(self.blips) > self._MAX_BLIPS:
+                # Keep the newest events if repainting is temporarily delayed.
+                self.blips = self.blips[-self._MAX_BLIPS :]
+        if self._metrics_enabled:
+            self._performance_metrics["max_blips"] = max(
+                self._performance_metrics["max_blips"], len(self.blips)
+            )
         if not self.decay_timer.isActive():
             self.decay_timer.start(30)
-        self.update()
+        # The decay timer repaints at most 30 ms later. Avoid scheduling a
+        # second paint for every audio block (audio arrives roughly every 20 ms),
+        # which otherwise doubles overlay compositor work under sustained audio.
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -203,6 +229,7 @@ class OverlayRadar(QWidget):
         )
 
     def paintEvent(self, event):
+        started_ns = time.perf_counter_ns() if self._metrics_enabled else None
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -254,3 +281,14 @@ class OverlayRadar(QWidget):
         if self.drag_enabled:
             painter.setPen(self._setup_pen)
             painter.drawEllipse(center, radius + 8, radius + 8)
+
+        if started_ns is not None:
+            elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
+            self._performance_metrics["paint_count"] += 1
+            self._performance_metrics["paint_total_ms"] += elapsed_ms
+            self._performance_metrics["paint_max_ms"] = max(
+                self._performance_metrics["paint_max_ms"], elapsed_ms
+            )
+
+    def performance_metrics(self):
+        return dict(self._performance_metrics)

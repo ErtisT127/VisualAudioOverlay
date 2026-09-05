@@ -35,9 +35,9 @@ sys.coinit_flags = 0  # COINIT_MULTITHREADED
 import ctypes
 import threading
 from ctypes import POINTER, byref, c_uint32, c_uint64, c_void_p, wintypes
+from typing import ClassVar
 
 import numpy as np
-from app_logging import get_logger
 from comtypes import COMMETHOD, GUID, HRESULT, COMObject, IUnknown
 from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
 
@@ -46,6 +46,8 @@ from pycaw.api.audioclient import WAVEFORMATEX as _PycawWAVEFORMATEX
 # we *construct* and pass into Initialize gets corrupted (-> E_INVALIDARG). We
 # define a correct 18-byte WAVEFORMATEX below and cast to pycaw's pointer type.
 from pycaw.api.audioclient import IAudioClient
+
+from app_logging import get_logger
 
 logger = get_logger("process_loopback")
 
@@ -103,13 +105,16 @@ _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 # comtypes' CoInitializeEx forces an STA apartment, but ActivateAudioInterfaceAsync
 # requires MTA - so we initialize COM ourselves via raw ole32.
 RPC_E_CHANGED_MODE = 0x80010106
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 258
+WAIT_FAILED = 0xFFFFFFFF
 
 
 def _co_initialize_mta() -> bool:
     """Initialize this thread's COM apartment as MTA. Returns True if we did the
     init (caller should later CoUninitialize), False if it was already set up."""
     hr = _ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
-    if hr == RPC_E_CHANGED_MODE:
+    if hr & 0xFFFFFFFF == RPC_E_CHANGED_MODE:
         return False  # already STA on this thread - process loopback will fail
     return hr >= 0
 
@@ -148,7 +153,7 @@ class PROPVARIANT(ctypes.Structure):
 # ── COM interfaces pycaw doesn't provide ───────────────────────────────────
 class IActivateAudioInterfaceAsyncOperation(IUnknown):
     _iid_ = GUID("{72A22D78-CDE4-431D-B8CC-843A71199B6D}")
-    _methods_ = [
+    _methods_: ClassVar[list] = [
         COMMETHOD(
             [],
             HRESULT,
@@ -167,12 +172,12 @@ class IAgileObject(IUnknown):
     needed - which is exactly true for our event-signalling handler."""
 
     _iid_ = GUID("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
-    _methods_ = []
+    _methods_: ClassVar[list] = []
 
 
 class IActivateAudioInterfaceCompletionHandler(IUnknown):
     _iid_ = GUID("{41D949AB-9862-444A-80F6-C261334DA5EB}")
-    _methods_ = [
+    _methods_: ClassVar[list] = [
         COMMETHOD(
             [],
             HRESULT,
@@ -188,7 +193,7 @@ class IActivateAudioInterfaceCompletionHandler(IUnknown):
 
 class IAudioCaptureClient(IUnknown):
     _iid_ = GUID("{C8ADBD64-E71E-48A0-A4DE-185C395CD317}")
-    _methods_ = [
+    _methods_: ClassVar[list] = [
         COMMETHOD(
             [],
             HRESULT,
@@ -212,7 +217,10 @@ class IAudioCaptureClient(IUnknown):
 class _CompletionHandler(COMObject):
     """Signals a Python Event when ActivateAudioInterfaceAsync finishes."""
 
-    _com_interfaces_ = [IActivateAudioInterfaceCompletionHandler, IAgileObject]
+    _com_interfaces_: ClassVar[list] = [
+        IActivateAudioInterfaceCompletionHandler,
+        IAgileObject,
+    ]
 
     def __init__(self):
         super().__init__()
@@ -242,7 +250,7 @@ def is_supported() -> bool:
     try:
         wv = sys.getwindowsversion()
         return wv.major > 10 or (wv.major == 10 and wv.build >= 20348)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - platform capability probe is best effort.
         logger.warning("Windows version check failed: %s", exc)
         return False
 
@@ -268,6 +276,8 @@ class ProcessLoopbackCapture:
         self._leftover = None
         self._started = False
         self._com_inited = False
+        self._wait_timeouts = 0
+        self._state_lock = threading.Lock()
 
     # ── Setup ──────────────────────────────────────────────────────────
     def start(self):
@@ -299,13 +309,19 @@ class ProcessLoopbackCapture:
         handler = _CompletionHandler()
         op = POINTER(IActivateAudioInterfaceAsyncOperation)()
 
-        _ActivateAudioInterfaceAsync(
+        hr = _ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             byref(IAudioClient._iid_),
             byref(pv),
             handler,
             byref(op),
         )
+        if hr != 0:
+            raise RuntimeError(
+                f"ActivateAudioInterfaceAsync HRESULT 0x{hr & 0xFFFFFFFF:08X}"
+            )
+        if not op:
+            raise RuntimeError("ActivateAudioInterfaceAsync returned no operation")
         # `params`/`pv` must outlive the call above; they do (locals held to here).
 
         if not handler.done.wait(timeout=3.0):
@@ -368,10 +384,23 @@ class ProcessLoopbackCapture:
             else:
                 self._leftover = None
 
-        while have < numframes and self._started:
+        while have < numframes:
             # Keep shutdown responsive even when the target is silent.
-            _kernel32.WaitForSingleObject(self._event, 50)
-            drained = self._drain_packets()
+            with self._state_lock:
+                event = self._event
+                if not self._started or not event:
+                    break
+                wait_result = _kernel32.WaitForSingleObject(event, 50)
+                if wait_result == WAIT_FAILED:
+                    raise OSError(
+                        ctypes.get_last_error(), "audio capture event wait failed"
+                    )
+                if wait_result == WAIT_TIMEOUT:
+                    self._wait_timeouts += 1
+                    break
+                if wait_result != WAIT_OBJECT_0:
+                    raise RuntimeError(f"unexpected audio wait result {wait_result}")
+                drained = self._drain_packets()
             if drained is not None:
                 take = min(len(drained), numframes - have)
                 data[have : have + take] = drained[:take]
@@ -387,18 +416,24 @@ class ProcessLoopbackCapture:
         pkt = self._capture.GetNextPacketSize()
         while pkt and pkt > 0:
             data_ptr, nframes, flags, _dpos, _qpc = self._capture.GetBuffer()
-            if nframes:
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT:
-                    arr = np.zeros((nframes, self.channels), dtype=np.float32)
-                else:
-                    fptr = ctypes.cast(data_ptr, POINTER(ctypes.c_float))
-                    arr = (
-                        np.ctypeslib.as_array(fptr, shape=(nframes * self.channels,))
-                        .reshape(nframes, self.channels)
-                        .copy()
-                    )
-                out.append(arr)
-            self._capture.ReleaseBuffer(nframes)
+            try:
+                if nframes:
+                    if flags & AUDCLNT_BUFFERFLAGS_SILENT:
+                        arr = np.zeros((nframes, self.channels), dtype=np.float32)
+                    else:
+                        fptr = ctypes.cast(data_ptr, POINTER(ctypes.c_float))
+                        arr = (
+                            np.ctypeslib.as_array(
+                                fptr, shape=(nframes * self.channels,)
+                            )
+                            .reshape(nframes, self.channels)
+                            .copy()
+                        )
+                    out.append(arr)
+            finally:
+                # WASAPI keeps the packet locked until ReleaseBuffer, including
+                # when conversion or array handling raises an exception.
+                self._capture.ReleaseBuffer(nframes)
             pkt = self._capture.GetNextPacketSize()
         if not out:
             return None
@@ -406,24 +441,27 @@ class ProcessLoopbackCapture:
 
     # ── Teardown ───────────────────────────────────────────────────────
     def close(self):
-        self._started = False
-        try:
-            if self._client is not None:
-                self._client.Stop()
-        except Exception as exc:
-            logger.debug("audio client stop failed during cleanup: %s", exc)
-        self._capture = None
-        self._client = None
-        if self._event:
-            try:
-                _kernel32.CloseHandle(self._event)
-            except Exception as exc:
-                logger.debug("capture event close failed: %s", exc)
+        with self._state_lock:
+            self._started = False
+            client = self._client
+            event = self._event
+            self._capture = None
+            self._client = None
             self._event = None
+        try:
+            if client is not None:
+                client.Stop()
+        except Exception as exc:  # noqa: BLE001 - COM cleanup must not mask shutdown.
+            logger.debug("audio client stop failed during cleanup: %s", exc)
+        if event:
+            try:
+                _kernel32.CloseHandle(event)
+            except Exception as exc:  # noqa: BLE001 - handle cleanup is best effort.
+                logger.debug("capture event close failed: %s", exc)
         if self._com_inited:
             try:
                 _ole32.CoUninitialize()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - COM cleanup must not mask shutdown.
                 logger.debug("COM uninitialization failed: %s", exc)
             self._com_inited = False
 
@@ -459,7 +497,7 @@ def _sessions_all_render_devices():
                 IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None
             ).QueryInterface(IAudioSessionManager2)
             session_enum = mgr.GetSessionEnumerator()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - endpoint enumeration is best effort.
             logger.debug(
                 "audio session manager unavailable for endpoint %s: %s", i, exc
             )
@@ -470,7 +508,7 @@ def _sessions_all_render_devices():
                 continue
             try:
                 ctl2 = ctl.QueryInterface(IAudioSessionControl2)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - session metadata is optional.
                 logger.debug(
                     "audio session query failed endpoint=%s session=%s: %s", i, j, exc
                 )
@@ -492,7 +530,7 @@ def list_audio_programs() -> list[dict]:
     """
     try:
         sessions = list(_sessions_all_render_devices())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - endpoint enumeration is best effort.
         logger.warning(
             "all-endpoint audio enumeration failed; using default endpoint: %s", exc
         )
@@ -502,7 +540,7 @@ def list_audio_programs() -> list[dict]:
             from pycaw.utils import AudioUtilities
 
             sessions = AudioUtilities.GetAllSessions()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - session enumeration is best effort.
             logger.error("default audio enumeration failed: %s", exc)
             return []
 
@@ -513,7 +551,7 @@ def list_audio_programs() -> list[dict]:
             continue  # system sounds / no owning process
         try:
             name = proc.name()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - process metadata is optional.
             logger.debug("audio process name lookup failed: %s", exc)
             continue
         if not name:
@@ -521,7 +559,12 @@ def list_audio_programs() -> list[dict]:
         friendly = name[:-4] if name.lower().endswith(".exe") else name
         # First PID seen for a given program name wins (dedupe multi-process apps
         # and the same app appearing on more than one endpoint).
-        found.setdefault(friendly, getattr(s, "ProcessId", proc.pid))
+        process_id = getattr(s, "ProcessId", None)
+        if process_id is None:
+            process_id = getattr(proc, "pid", None)
+        if process_id is None:
+            continue
+        found.setdefault(friendly, process_id)
 
     return [
         {"name": k, "pid": v}

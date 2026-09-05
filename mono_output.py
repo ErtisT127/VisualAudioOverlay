@@ -29,6 +29,7 @@ import queue
 import numpy as np
 import soundcard as sc
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from app_logging import get_logger
 
 logger = get_logger("mono_output")
@@ -42,7 +43,7 @@ def list_output_devices() -> list[str]:
     """Names of available playback devices, for the mono-output picker."""
     try:
         return [s.name for s in sc.all_speakers()]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - device enumeration is best effort.
         logger.warning("output device enumeration failed: %s", exc)
         return []
 
@@ -50,7 +51,7 @@ def list_output_devices() -> list[str]:
 def default_output_name() -> str | None:
     try:
         return sc.default_speaker().name
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - default device lookup is best effort.
         logger.warning("default output lookup failed: %s", exc)
         return None
 
@@ -67,6 +68,25 @@ def detect_virtual_cable() -> str | None:
         if any(h in low for h in _CABLE_HINTS):
             return name
     return None
+
+
+def output_device_state() -> dict:
+    """Enumerate speakers once and derive the complete hardware picker state."""
+    devices = list_output_devices()
+    try:
+        default = sc.default_speaker().name
+    except Exception as exc:  # noqa: BLE001 - device enumeration is best effort.
+        logger.warning("default output lookup failed: %s", exc)
+        default = None
+    cable = next(
+        (
+            name
+            for name in devices
+            if any(hint in name.lower() for hint in _CABLE_HINTS)
+        ),
+        None,
+    )
+    return {"devices": devices, "default": default, "cable": cable}
 
 
 class MonoMixThread(QThread):
@@ -116,7 +136,7 @@ class MonoMixThread(QThread):
                 spk = sc.get_speaker(self.device_name)
                 if spk is not None:
                     return spk
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - selected device may disappear.
                 logger.debug("selected mono speaker unavailable: %s", exc)
         return sc.default_speaker()
 
@@ -156,4 +176,8 @@ class MonoMixThread(QThread):
 
     def stop(self):
         self._running = False
-        self.wait()
+        self.requestInterruption()
+        if not self.wait(1000):
+            logger.error("mono playback thread did not stop within 1 second")
+            return False
+        return True

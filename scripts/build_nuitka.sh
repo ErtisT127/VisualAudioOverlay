@@ -39,8 +39,19 @@ if [[ ! -f "$soundcard_header" ]]; then
     exit 1
 fi
 
+if ! qtwebengine_locale="$($python -c 'import os, PyQt6; print(os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "translations", "qtwebengine_locales", "en-US.pak"))')"; then
+    printf '%s\n' "Could not locate the PyQt6 QtWebEngine locale package. Install requirements.txt first." >&2
+    exit 1
+fi
+qtwebengine_locale="${qtwebengine_locale//$'\r'/}"
+if [[ ! -f "$qtwebengine_locale" ]]; then
+    printf '%s\n' "QtWebEngine locale package is missing: $qtwebengine_locale" >&2
+    exit 1
+fi
+
 nuitka_arguments=(
     "--include-data-files=$soundcard_header=soundcard/mediafoundation.py.h"
+    "--include-data-files=$qtwebengine_locale=qtwebengine_locales/en-US.pak"
 )
 if [[ -d "$project_root/vendor" ]]; then
     nuitka_arguments+=("--include-data-dir=vendor=vendor")

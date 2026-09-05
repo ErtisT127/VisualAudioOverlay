@@ -1,9 +1,12 @@
 import multiprocessing as mp
+import os
+import threading
+import time
 
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from app_logging import get_logger
+from app_logging import LOG_DEBUG_ENV, get_logger
 from direction import band_rms, stereo_angle, surround_angle
 
 logger = get_logger("audio_capture")
@@ -39,6 +42,7 @@ class AudioCaptureThread(QThread):
         mono_device=None,
         _manager=True,
         shared_params=None,
+        metrics_enabled=None,
     ):
         super().__init__()
         self._manager = _manager
@@ -63,9 +67,59 @@ class AudioCaptureThread(QThread):
         self._mono = None
         self._process = None
         self._recv_conn = None
+        self._audio_mailbox_lock = threading.Lock()
+        self._latest_audio = None
+        self._performance_metrics = {
+            "pipe_audio_received": 0,
+            "mailbox_published": 0,
+            "mailbox_overwritten": 0,
+            "mailbox_consumed": 0,
+            "max_mailbox_age_ms": 0.0,
+        }
+        self._metrics_enabled = (
+            os.environ.get(LOG_DEBUG_ENV) == "1"
+            if metrics_enabled is None
+            else bool(metrics_enabled)
+        )
         self._shared_params = shared_params or mp.get_context("spawn").Array(
             "d", [sensitivity, gain, freq_low, freq_high, max_amplitude]
         )
+
+    def publish_latest_audio(self, angle, intensity):
+        """Replace the pending GUI sample instead of queueing stale audio."""
+        published_ns = time.monotonic_ns() if self._metrics_enabled else None
+        sample = (float(angle), float(intensity), published_ns)
+        with self._audio_mailbox_lock:
+            if self._metrics_enabled:
+                self._performance_metrics["mailbox_published"] += 1
+                if self._latest_audio is not None:
+                    self._performance_metrics["mailbox_overwritten"] += 1
+            self._latest_audio = sample
+
+    def take_latest_audio(self):
+        """Atomically consume the newest pending sample, if one exists."""
+        with self._audio_mailbox_lock:
+            sample = self._latest_audio
+            self._latest_audio = None
+            if sample is None:
+                return None
+            if self._metrics_enabled:
+                self._performance_metrics["mailbox_consumed"] += 1
+                age_ms = (time.monotonic_ns() - sample[2]) / 1_000_000
+                self._performance_metrics["max_mailbox_age_ms"] = max(
+                    self._performance_metrics["max_mailbox_age_ms"], age_ms
+                )
+        return sample[0], sample[1]
+
+    def clear_latest_audio(self):
+        with self._audio_mailbox_lock:
+            self._latest_audio = None
+
+    def performance_metrics(self):
+        with self._audio_mailbox_lock:
+            metrics = dict(self._performance_metrics)
+            metrics["mailbox_pending"] = int(self._latest_audio is not None)
+        return metrics
 
     def set_target(self, pid, name=None):
         """Choose the capture source. Only takes effect before the thread starts."""
@@ -162,26 +216,22 @@ class AudioCaptureThread(QThread):
         received_error = False
         received_ready = False
         try:
-            while self.running:
+            done = False
+            while self.running and not done:
                 if recv_conn.poll(0.1):
-                    message = recv_conn.recv()
-                    kind, *payload = message
-                    if kind == "audio":
-                        self.audio_data_signal.emit(
-                            float(payload[0]), float(payload[1])
-                        )
-                    elif kind == "device":
-                        self.device_info_signal.emit(str(payload[0]), int(payload[1]))
-                    elif kind == "status":
-                        self.status_signal.emit(str(payload[0]))
-                    elif kind == "error":
-                        received_error = True
-                        self.error_signal.emit(str(payload[0]))
-                    elif kind == "ready":
-                        received_ready = True
-                        self.ready_signal.emit()
-                    elif kind == "done":
-                        break
+                    # Drain the currently available batch. Audio messages replace
+                    # one bounded mailbox value; control messages remain ordered.
+                    while True:
+                        kind = self._handle_manager_message(recv_conn.recv())
+                        if kind == "error":
+                            received_error = True
+                        elif kind == "ready":
+                            received_ready = True
+                        elif kind == "done":
+                            done = True
+                            break
+                        if not recv_conn.poll():
+                            break
                 elif not proc.is_alive():
                     break
         except (EOFError, OSError):
@@ -203,10 +253,40 @@ class AudioCaptureThread(QThread):
             if proc.is_alive():
                 proc.terminate()
             proc.join(timeout=1.0)
+            if proc.is_alive():
+                logger.warning(
+                    "capture worker ignored terminate; forcing kill pid=%s", proc.pid
+                )
+                proc.kill()
+                proc.join(timeout=1.0)
+            if proc.is_alive():
+                logger.error("capture worker still alive after kill pid=%s", proc.pid)
             recv_conn.close()
             self._process = None
             self._recv_conn = None
+            if self._metrics_enabled:
+                logger.debug(
+                    "capture performance metrics=%s", self.performance_metrics()
+                )
             logger.debug("capture manager cleanup complete")
+
+    def _handle_manager_message(self, message):
+        """Dispatch one worker message and return its kind for loop control."""
+        kind, *payload = message
+        if kind == "audio":
+            if self._metrics_enabled:
+                with self._audio_mailbox_lock:
+                    self._performance_metrics["pipe_audio_received"] += 1
+            self.publish_latest_audio(payload[0], payload[1])
+        elif kind == "device":
+            self.device_info_signal.emit(str(payload[0]), int(payload[1]))
+        elif kind == "status":
+            self.status_signal.emit(str(payload[0]))
+        elif kind == "error":
+            self.error_signal.emit(str(payload[0]))
+        elif kind == "ready":
+            self.ready_signal.emit()
+        return kind
 
     # ── Mono down-mix output ───────────────────────────────────────────
     def _start_mono(self):
@@ -225,7 +305,7 @@ class AudioCaptureThread(QThread):
             logger.info(
                 "Mono output started device=%s", self.mono_device or "default device"
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional mono output must degrade gracefully.
             logger.warning("Mono output unavailable; continuing without it: %s", e)
             self._mono = None
 
@@ -238,16 +318,17 @@ class AudioCaptureThread(QThread):
     def _stop_mono(self):
         if self._mono is not None:
             try:
-                self._mono.stop()
+                if not self._mono.stop():
+                    return
             except Exception:
-                pass
+                logger.exception("Mono output stop failed")
             self._mono = None
 
     def _run_process_loopback(self):
         """Capture only the selected program; never fall back to system audio."""
         try:
             from process_loopback import ProcessLoopbackCapture
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional process loopback may be unavailable.
             message = self._user_failure_message()
             logger.error("Process loopback unavailable: %s", e)
             self.error_signal.emit(message)
@@ -307,7 +388,7 @@ class AudioCaptureThread(QThread):
                     if default_name in lb.name:
                         device = lb
                         break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - device enumeration is best effort.
                 logger.debug("default speaker lookup failed: %s", exc)
 
             if not device:
@@ -403,6 +484,7 @@ class AudioCaptureThread(QThread):
             proc is not None and proc.is_alive(),
         )
         self.running = False
+        self.clear_latest_audio()
         if proc is not None and proc.is_alive():
             proc.terminate()
             logger.debug("capture worker terminate sent pid=%s", proc.pid)

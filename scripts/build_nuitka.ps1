@@ -28,8 +28,18 @@ if (-not (Test-Path -LiteralPath $soundcardHeader -PathType Leaf)) {
     throw "soundcard header is missing: $soundcardHeader"
 }
 
+$qtWebEngineLocale = & $python -c "import os, PyQt6; print(os.path.join(os.path.dirname(PyQt6.__file__), 'Qt6', 'translations', 'qtwebengine_locales', 'en-US.pak'))"
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not locate the PyQt6 QtWebEngine locale package. Install requirements.txt first."
+}
+$qtWebEngineLocale = ($qtWebEngineLocale -join "`n").Trim()
+if ([string]::IsNullOrWhiteSpace($qtWebEngineLocale) -or -not (Test-Path -LiteralPath $qtWebEngineLocale -PathType Leaf)) {
+    throw "QtWebEngine locale package is missing: $qtWebEngineLocale"
+}
+
 $nuitkaArguments = @(
     "--include-data-files=$soundcardHeader=soundcard/mediafoundation.py.h"
+    "--include-data-files=$qtWebEngineLocale=qtwebengine_locales/en-US.pak"
 )
 if (Test-Path -LiteralPath (Join-Path $projectRoot "vendor") -PathType Container) {
     $nuitkaArguments += "--include-data-dir=vendor=vendor"

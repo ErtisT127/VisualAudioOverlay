@@ -20,7 +20,7 @@ def configure_logging(
     debug_enabled: bool = False,
 ):
     """Configure file logging once; disabled mode performs no file I/O."""
-    global _configured, _exception_hook_installed
+    global _configured
     if _configured:
         return
 
@@ -78,7 +78,7 @@ def configure_logging(
             console_logger.setLevel(logging.INFO)
         else:
             console_logger.setLevel(logging.CRITICAL + 1)
-    except Exception:
+    except Exception:  # noqa: BLE001 - logging setup must not block startup.
         # Diagnostics must never prevent the application from starting.
         logger.setLevel(logging.CRITICAL + 1)
         warnings_logger.setLevel(logging.CRITICAL + 1)

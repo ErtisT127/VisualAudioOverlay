@@ -73,7 +73,7 @@ reads audio you are already playing, there is no interaction with the game itsel
 ## Getting started (from source)
 
 ```bash
-git clone https://github.com/mike-s-zaugg/VisualAudioOverlay.git
+git clone https://github.com/ErtisT127/VisualAudioOverlay.git
 cd VisualAudioOverlay
 pip install -r requirements.txt
 python main.py
@@ -117,68 +117,17 @@ virtual audio cable, which the app then reads. We use **VB-CABLE** for this.
 > (www.vb-cable.com). VB-CABLE is donationware - donations are welcome. See
 > [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-## Build a standalone .exe
+## Build a one-file .exe
 
 ```bash
-pip install pyinstaller
-pyinstaller AudioRadar.spec
+pip install -r requirements.txt -r requirements-build.txt
+bash scripts/build_nuitka.sh
 ```
 
-The build bundles the full UI, icons, and font, so the executable runs offline
-with no extra setup. Output lands in `dist/`.
+The one-file build is written to `dist/nuitka/`, bundles the dashboard, icons,
+fonts, Qt WebEngine, and the dynamic audio/COM modules, and runs offline without
+a Python installation.
 
-> If a one-file build shows a blank window (a known QtWebEngine quirk), use a
-> one-directory build instead.
-
-## Roadmap
-
-- **Editable presets** saved to disk.
-- **Haptic output.** Drive ButtKicker-style shakers from the strongest audio cue.
-
-## Project layout
-
-| File | Role |
-|------|------|
-| `main.py` | App entry. Hosts the control panel and overlay, exposes the JS/Python bridge. |
-| `audio_capture.py` | Captures loopback audio, band-pass filters it, computes direction + intensity. |
-| `process_loopback.py` | Per-application capture via the WASAPI process-loopback API, plus enumeration of programs with audio. |
-| `overlay.py` | The transparent, click-through radar window. |
-| `dashboard_v2/` | The control-panel UI (HTML/CSS/JS, icons, bundled font). |
-
-## Support
-
-Visual Audio Overlay is free. If it helps you, you can support development here:
-
-**[Buy Me a Coffee](https://buymeacoffee.com/mikezaugg)**
-
-## Disclaimer
-
-This tool reads only standard Windows audio output and does not read or modify
-game memory or files. It is intended as an accessibility aid. Anti-cheat policies
-vary between games, so use it at your own discretion.
-
-## AI Usage
-
-I want to publicly tell how I used AI in this code. The UI was 100% made by myself.
-I have used Claude Code for some logic and to help me with decisions. Most of my code is pushed through it.
-
-## Contributing
-
-Contributions are welcome. Bug reports, fixes, and new features all help. Please
-read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and see
-[SECURITY.md](SECURITY.md) for how to report vulnerabilities.
-
-Good first issues to pick up: mono audio output for single-sided listeners and a
-Linux port.
-
-## License
-
-Copyright (c) 2026 Mike Zaugg.
-
-This project is **source-available**, not open source. It is licensed under the
-**Functional Source License, Version 1.1, MIT Future License (FSL-1.1-MIT)**. In
-short: you are free to use, modify, and contribute to the code for any purpose
-except building a competing product. Each release automatically becomes available
-under the permissive MIT license two years after it ships.
-
-See the [LICENSE](LICENSE) for the full terms.
+The default release target is a one-file build for simpler distribution. A
+one-directory build can be produced by replacing `--onefile` with
+`--standalone`; it starts faster and avoids extracting Qt resources at launch.
