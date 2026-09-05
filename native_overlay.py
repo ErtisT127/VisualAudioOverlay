@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import ctypes
 import os
-from pathlib import Path
 from ctypes import wintypes
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPoint, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
@@ -187,17 +187,11 @@ class NativeOverlay(QObject):
 
     def _set_geometry(self):
         previous_scale = self._native_scale
-        screen, native_rect = self._screen_mapping(
-            self._x + self._width / 2, self._y + self._height / 2
-        )
+        screen, native_rect = self._screen_mapping(self._x + self._width / 2, self._y + self._height / 2)
         # Test doubles and non-Windows callers do not expose QScreen objects;
         # retain the legacy scale hook for those paths while native Windows
         # instances use the actual screen DPI.
-        scale = (
-            self._screen_scale(screen)
-            if screen is not None
-            else self._scale_for_point(self._x, self._y)
-        )
+        scale = self._screen_scale(screen) if screen is not None else self._scale_for_point(self._x, self._y)
         self._native_scale = scale
         if native_rect is not None and screen is not None:
             logical_geo = screen.geometry()
@@ -208,9 +202,7 @@ class NativeOverlay(QObject):
             native_y = round(self._y * scale)
         native_width = max(1, round(self._width * scale))
         native_height = max(1, round(self._height * scale))
-        if not self._dll.vao_set_geometry(
-            self._handle, native_x, native_y, native_width, native_height
-        ):
+        if not self._dll.vao_set_geometry(self._handle, native_x, native_y, native_width, native_height):
             raise RuntimeError("failed to set native overlay geometry")
         if abs(scale - previous_scale) > 1e-3:
             self._apply_style()
@@ -219,7 +211,7 @@ class NativeOverlay(QObject):
     def _screen_scale(screen) -> float:
         try:
             return max(1.0, float(screen.devicePixelRatio())) if screen else 1.0
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             return 1.0
 
     def _screen_mapping(self, x: float, y: float):
@@ -254,6 +246,7 @@ class NativeOverlay(QObject):
             if user32 is None:
                 user32 = ctypes.WinDLL("user32", use_last_error=True)
                 NativeOverlay._user32 = user32
+
             class _MonitorInfo(ctypes.Structure):
                 _fields_ = [
                     ("cbSize", wintypes.DWORD),
@@ -280,9 +273,16 @@ class NativeOverlay(QObject):
                 info = _MonitorInfo()
                 info.cbSize = ctypes.sizeof(info)
                 if get_info(handle, ctypes.byref(info)):
-                    result.append((str(info.szDevice), info.rcMonitor.left,
-                                   info.rcMonitor.top, info.rcMonitor.right,
-                                   info.rcMonitor.bottom, info.dwFlags))
+                    result.append(
+                        (
+                            str(info.szDevice),
+                            info.rcMonitor.left,
+                            info.rcMonitor.top,
+                            info.rcMonitor.right,
+                            info.rcMonitor.bottom,
+                            info.dwFlags,
+                        )
+                    )
                 return True
 
             if not user32.EnumDisplayMonitors(None, None, callback, 0):
@@ -301,9 +301,9 @@ class NativeOverlay(QObject):
             expected_w = round(logical.width() * scale)
             expected_h = round(logical.height() * scale)
             candidates = [
-                item for item in result
-                if abs((item[3] - item[1]) - expected_w) <= 2
-                and abs((item[4] - item[2]) - expected_h) <= 2
+                item
+                for item in result
+                if abs((item[3] - item[1]) - expected_w) <= 2 and abs((item[4] - item[2]) - expected_h) <= 2
             ]
             app = QApplication.instance()
             primary = app.primaryScreen() if app is not None else None
@@ -314,7 +314,8 @@ class NativeOverlay(QObject):
             non_primary = [item for item in candidates if not (item[5] & 1)]
             if non_primary:
                 peers = [
-                    candidate for candidate in screens
+                    candidate
+                    for candidate in screens
                     if abs(candidate.geometry().width() * NativeOverlay._screen_scale(candidate) - expected_w) <= 2
                     and abs(candidate.geometry().height() * NativeOverlay._screen_scale(candidate) - expected_h) <= 2
                     and candidate != primary
@@ -327,7 +328,7 @@ class NativeOverlay(QObject):
             index = screens.index(screen)
             if 0 <= index < len(result):
                 return result[index][1:5]
-        except (AttributeError, OSError, TypeError, ValueError):
+        except AttributeError, OSError, TypeError, ValueError:
             return None
         return None
 
@@ -363,9 +364,7 @@ class NativeOverlay(QObject):
                             round(geo.x() + (native_x - rect[0]) / scale),
                             round(geo.y() + (native_y - rect[1]) / scale),
                         )
-        scale = self._scale_for_point(
-            native_x / self._native_scale, native_y / self._native_scale
-        )
+        scale = self._scale_for_point(native_x / self._native_scale, native_y / self._native_scale)
         return round(native_x / scale), round(native_y / scale)
 
     def set_drag_enabled(self, enabled):
@@ -388,9 +387,7 @@ class NativeOverlay(QObject):
 
     def set_capture_generation(self, generation):
         self._generation = int(generation)
-        if not self._dll.vao_set_generation(
-            self._handle, self._generation
-        ):
+        if not self._dll.vao_set_generation(self._handle, self._generation):
             raise RuntimeError("failed to change native overlay generation")
 
     def update_audio_data(self, angle, intensity, generation=None):

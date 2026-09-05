@@ -1,0 +1,5 @@
+# The source already follows LLVM style (attached braces, kConstant naming)
+# but with 4-space indentation.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100

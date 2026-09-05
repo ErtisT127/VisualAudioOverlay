@@ -53,6 +53,7 @@
 # nuitka-project: --noinclude-data-files=qtwebengine_resources_100p.debug.pak
 # nuitka-project: --noinclude-data-files=qtwebengine_resources_200p.debug.pak
 
+import contextlib
 import ctypes
 import json
 import math
@@ -65,9 +66,7 @@ from typing import ClassVar
 
 _exe_name = os.path.basename(sys.executable).lower()
 _IS_PACKAGED_LAUNCH = (
-    "__compiled__" in globals()
-    or bool(getattr(sys, "frozen", False))
-    or not _exe_name.startswith(("python", "pypy"))
+    "__compiled__" in globals() or bool(getattr(sys, "frozen", False)) or not _exe_name.startswith(("python", "pypy"))
 )
 
 
@@ -84,7 +83,7 @@ def _initial_windows_scale() -> float:
             dpi = int(get_dpi())
             if dpi > 0:
                 return dpi / 96.0
-    except (AttributeError, OSError, TypeError, ValueError):
+    except AttributeError, OSError, TypeError, ValueError:
         pass
     return 1.0
 
@@ -119,7 +118,7 @@ def _enable_per_monitor_dpi_awareness():
             setter.argtypes = [ctypes.c_int]
             setter.restype = ctypes.c_long
             setter(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-    except (AttributeError, OSError, TypeError, ValueError):
+    except AttributeError, OSError, TypeError, ValueError:
         # This must never prevent the dashboard from starting.
         return
 
@@ -145,7 +144,7 @@ def _append_webengine_scale_flag(scale: float):
     """
     try:
         scale = float(scale)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return
     if not math.isfinite(scale) or scale <= 0:
         return
@@ -153,9 +152,9 @@ def _append_webengine_scale_flag(scale: float):
     if "--force-device-scale-factor=" in flags:
         return
     formatted = f"{scale:.4f}".rstrip("0").rstrip(".")
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-        f"{flags} --force-device-scale-factor={formatted}".strip()
-    )
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} --force-device-scale-factor={formatted}".strip()
+
+
 # Chromium reads this during QtWebEngine startup, before QApplication has a
 # primary QScreen that Python can inspect.  Configure it at import time so the
 # first renderer surface uses the same scale as Qt instead of being resampled.
@@ -165,16 +164,16 @@ from PyQt6.QtCore import (
     QAbstractNativeEventFilter,
     QEvent,
     QObject,
+    Qt,
     QThread,
     QTimer,
     QtMsgType,
-    Qt,
     QUrl,
     pyqtSignal,
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt6.QtGui import QAction, QIcon, QGuiApplication
+from PyQt6.QtGui import QAction, QGuiApplication, QIcon
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEnginePage
@@ -206,9 +205,7 @@ IS_PACKAGED = _IS_PACKAGED_LAUNCH
 if IS_PACKAGED:
     # Nuitka onefile exposes the launch directory explicitly because the
     # payload's __file__/sys.executable can point at the temporary extraction.
-    DATA_DIR = os.environ.get("NUITKA_ONEFILE_DIRECTORY") or os.path.dirname(
-        os.path.abspath(sys.executable)
-    )
+    DATA_DIR = os.environ.get("NUITKA_ONEFILE_DIRECTORY") or os.path.dirname(os.path.abspath(sys.executable))
 else:
     DATA_DIR = RESOURCE_DIR
 
@@ -218,15 +215,9 @@ LIFECYCLE_LOG_FILE = os.path.join(DATA_DIR, "lifecycle.log")
 _inherited_log_enabled = os.environ.get(LOG_ENABLED_ENV)
 _inherited_log_debug = os.environ.get(LOG_DEBUG_ENV)
 _logging_enabled = (
-    _inherited_log_enabled == "1"
-    if _inherited_log_enabled in ("0", "1")
-    else not IS_PACKAGED or "--debug" in sys.argv
+    _inherited_log_enabled == "1" if _inherited_log_enabled in ("0", "1") else not IS_PACKAGED or "--debug" in sys.argv
 )
-_debug_logging = (
-    _inherited_log_debug == "1"
-    if _inherited_log_debug in ("0", "1")
-    else "--debug" in sys.argv
-)
+_debug_logging = _inherited_log_debug == "1" if _inherited_log_debug in ("0", "1") else "--debug" in sys.argv
 os.environ[LOG_ENABLED_ENV] = "1" if _logging_enabled else "0"
 os.environ[LOG_DEBUG_ENV] = "1" if _debug_logging else "0"
 LIFECYCLE_LOG_FILE = os.environ.get(LOG_PATH_ENV, LIFECYCLE_LOG_FILE)
@@ -258,9 +249,7 @@ qInstallMessageHandler(_qt_message_handler)
 # packaged .exe.
 DASHBOARD_FILE = os.path.join(RESOURCE_DIR, "dashboard_v2", "index.html")
 if __name__ == "__main__":
-    logger.debug(
-        "dashboard path=%s exists=%s", DASHBOARD_FILE, os.path.exists(DASHBOARD_FILE)
-    )
+    logger.debug("dashboard path=%s exists=%s", DASHBOARD_FILE, os.path.exists(DASHBOARD_FILE))
 
 # App icon (window/taskbar). Use the PNG, which Qt core handles without an image
 # format plugin in the packaged executable. Nuitka uses the ICO for the executable
@@ -276,9 +265,7 @@ REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay"
 # Latest-release JSON (no auth needed; 60 req/hr per IP is plenty for one check
 # per launch). Used by the in-app update check to reach users who already have
 # the app installed - we have no telemetry/emails, so this is the only channel.
-REPO_LATEST_RELEASE_API = (
-    "https://api.github.com/repos/ErtisT127/VisualAudioOverlay/releases/latest"
-)
+REPO_LATEST_RELEASE_API = "https://api.github.com/repos/ErtisT127/VisualAudioOverlay/releases/latest"
 SINGLE_INSTANCE_NAME = "VisualAudioOverlay.SingleInstance"
 _UPDATE_CHECK_STARTED = False
 # Footstep bands rev. 2026-07-02, based on spectral analysis of the actual CS2
@@ -349,7 +336,7 @@ def _bounded_number(value, cast, minimum, maximum):
         return None
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     if not math.isfinite(numeric) or not minimum <= numeric <= maximum:
         return None
@@ -417,9 +404,7 @@ def _initial_profiles() -> dict:
         values = {**_PRESET_LEVEL_DEFAULTS, **band}
         profiles[name] = {
             "name": name,
-            "sensitivity": round(
-                values["sensitivity"] * PROFILE_SLIDER_SCALE["sensitivity"]
-            ),
+            "sensitivity": round(values["sensitivity"] * PROFILE_SLIDER_SCALE["sensitivity"]),
             "gain": round(values["gain"] * PROFILE_SLIDER_SCALE["gain"]),
             "freq_low": values["freq_low"],
             "freq_high": values["freq_high"],
@@ -431,7 +416,7 @@ def _initial_profiles() -> dict:
 def _load_json_mapping(path: str) -> dict:
     """Read a JSON object, returning an empty mapping for missing/bad files."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
         if isinstance(data, dict):
             logger.debug("configuration loaded path=%s", path)
@@ -450,9 +435,7 @@ def _save_json_mapping(path: str, data: dict) -> bool:
     try:
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
-        fd, temporary_path = tempfile.mkstemp(
-            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory
-        )
+        fd, temporary_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
@@ -467,10 +450,8 @@ def _save_json_mapping(path: str, data: dict) -> bool:
         return False
     finally:
         if temporary_path:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(temporary_path)
-            except OSError:
-                pass
 
 
 # ── Bridge ─────────────────────────────────────────────────────────────────
@@ -516,11 +497,7 @@ class UpdateCheckThread(QThread):
 
             tag = (data.get("tag_name") or "").strip()
             url = data.get("html_url") or REPO_URL + "/releases/latest"
-            if (
-                not self.isInterruptionRequested()
-                and tag
-                and _parse_version(tag) > _parse_version(APP_VERSION)
-            ):
+            if not self.isInterruptionRequested() and tag and _parse_version(tag) > _parse_version(APP_VERSION):
                 self.updateFound.emit(tag.lstrip("vV"), url)
         except Exception as exc:  # noqa: BLE001 - update checks are optional.
             # Optional network checks stay silent in the UI, but remain diagnosable.
@@ -587,9 +564,7 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         "LEFT": 0x25,
         "RIGHT": 0x27,
     }
-    _TEXT_KEYS: ClassVar[set[str]] = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") | {
-        "SPACE"
-    }
+    _TEXT_KEYS: ClassVar[set[str]] = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") | {"SPACE"}
     _RESERVED: ClassVar[set[str]] = {"ALT+F4", "CTRL+ALT+DELETE"}
 
     def __init__(self, owner):
@@ -617,9 +592,7 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         normalized = "+".join([m for m in cls._MODIFIERS if m in seen] + [key])
         if normalized in cls._RESERVED:
             return None
-        if key in cls._TEXT_KEYS and not mods & (
-            cls._MODIFIERS["CTRL"] | cls._MODIFIERS["ALT"]
-        ):
+        if key in cls._TEXT_KEYS and not mods & (cls._MODIFIERS["CTRL"] | cls._MODIFIERS["ALT"]):
             return None
         return mods, cls._VK_NAMES[key], normalized
 
@@ -627,9 +600,7 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         if self.registered and self._user32:
             self._user32.UnregisterHotKey(int(self.owner.winId()), self.hotkey_id)
             controller = getattr(self.owner, "hotkey_controller", None)
-            logger.info(
-                "global hotkey unregistered combo=%s", getattr(controller, "combo", "")
-            )
+            logger.info("global hotkey unregistered combo=%s", getattr(controller, "combo", ""))
         self.registered = False
 
     def register(self, combo):
@@ -783,15 +754,11 @@ class HotkeyController:
         parsed = GlobalHotkeyFilter.parse(combo)
         if not parsed:
             logger.warning("hotkey commit rejected combo=%r", combo)
-            return self._publish(
-                "Use F1-F24 or a navigation key. Letters, numbers, and Space need Ctrl or Alt."
-            )
+            return self._publish("Use F1-F24 or a navigation key. Letters, numbers, and Space need Ctrl or Alt.")
         normalized = parsed[2]
         if not self.filter.register(normalized):
             logger.warning("hotkey commit unavailable combo=%s", normalized)
-            return self._publish(
-                "That shortcut is already in use by another application."
-            )
+            return self._publish("That shortcut is already in use by another application.")
         self.combo = normalized
         self.registered = True
         self.status = "active"
@@ -814,9 +781,7 @@ class HotkeyController:
             logger.warning("hotkey cancel restore unavailable combo=%s", self.combo)
         else:
             self.status = "unbound"
-        logger.info(
-            "hotkey edit cancelled restored_combo=%s state=%s", self.combo, self.status
-        )
+        logger.info("hotkey edit cancelled restored_combo=%s state=%s", self.combo, self.status)
         return self._publish()
 
     def clear(self):
@@ -842,20 +807,14 @@ class Bridge(QObject):
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
     monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
     updateAvailable = pyqtSignal(str, str)  # (latest_version, release_page_url)
-    appearanceChanged = pyqtSignal(
-        str
-    )  # saved overlay accent colour + thickness as JSON
+    appearanceChanged = pyqtSignal(str)  # saved overlay accent colour + thickness as JSON
     selectedPresetChanged = pyqtSignal(str)  # internal preset option key
-    audioSettingsChanged = pyqtSignal(
-        str
-    )  # all five live audio params, so JS moves the sliders
+    audioSettingsChanged = pyqtSignal(str)  # all five live audio params, so JS moves the sliders
     operationBusyChanged = pyqtSignal(bool)  # Start/End lifecycle lock
-    operationStateChanged = pyqtSignal(
-        str
-    )  # idle/starting/running/restarting/stopping/closing
+    operationStateChanged = pyqtSignal(str)  # idle/starting/running/restarting/stopping/closing
     hotkeyStateChanged = pyqtSignal(str)
 
-    def __init__(self, app: "AudioRadarApp"):
+    def __init__(self, app: AudioRadarApp):
         super().__init__()
         self._app = app
 
@@ -938,7 +897,7 @@ class Bridge(QObject):
                 self._app._queue_settings_save()
             else:
                 logger.warning("invalid preset state shape ignored")
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except TypeError, ValueError, json.JSONDecodeError:
             logger.warning("invalid preset state payload ignored")
 
     @pyqtSlot(bool)
@@ -1164,9 +1123,7 @@ class AudioRadarApp(QMainWindow):
         self._dashboard_freeze_timer = QTimer(self)
         self._dashboard_freeze_timer.setSingleShot(True)
         self._dashboard_freeze_timer.setInterval(600)
-        self._dashboard_freeze_timer.timeout.connect(
-            self._freeze_dashboard_if_hidden
-        )
+        self._dashboard_freeze_timer.timeout.connect(self._freeze_dashboard_if_hidden)
         self._program_list_thread = None
         self._mono_device_thread = None
         self._mono_refresh_pending = False
@@ -1177,18 +1134,14 @@ class AudioRadarApp(QMainWindow):
         self._capture_terminal_error = None
         self._single_instance_server = single_instance_server
         if self._single_instance_server is not None:
-            self._single_instance_server.newConnection.connect(
-                self._on_single_instance_connection
-            )
+            self._single_instance_server.newConnection.connect(self._on_single_instance_connection)
         self._setup_tray_icon()
 
         self.invert_direction = False
         self.selected_monitor = 0
         self._selected_monitor_name = None
         self.selected_program = None  # None = whole-system audio; else a program name
-        fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(
-            SETTINGS_FILE
-        )
+        fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(SETTINGS_FILE)
         self.profiles = self._load_profiles()
         self.settings = self._load_settings()
         if "hotkey" not in self.settings:
@@ -1197,8 +1150,7 @@ class AudioRadarApp(QMainWindow):
         # Monitor and program are session-only choices; never restore stale
         # values from a previous run.
         removed_session_keys = any(
-            self.settings.pop(key, None) is not None
-            for key in ("selected_monitor", "selected_program")
+            self.settings.pop(key, None) is not None for key in ("selected_monitor", "selected_program")
         )
         if fresh_install:
             self.profiles = _initial_profiles()
@@ -1246,11 +1198,7 @@ class AudioRadarApp(QMainWindow):
         # anything the user changed after picking it. Defaults to "All Sounds",
         # which is what an unrestored dropdown already displays.
         saved_preset = self.settings.get("selected_preset")
-        self.selected_preset = (
-            saved_preset
-            if isinstance(saved_preset, str) and saved_preset
-            else "builtin:all-sounds"
-        )
+        self.selected_preset = saved_preset if isinstance(saved_preset, str) and saved_preset else "builtin:all-sounds"
         saved_state = self.settings.get("preset_state")
         self.preset_state = (
             saved_state
@@ -1262,9 +1210,7 @@ class AudioRadarApp(QMainWindow):
         )
         value = self.preset_state.get("id", "")
         valid = value == "builtin:all-sounds" or (
-            isinstance(value, str)
-            and value.startswith("profile:")
-            and value[8:] in self.profiles
+            isinstance(value, str) and value.startswith("profile:") and value[8:] in self.profiles
         )
         if not valid:
             self.preset_state = {"id": "builtin:all-sounds", "dirty": False}
@@ -1300,9 +1246,7 @@ class AudioRadarApp(QMainWindow):
         # the look survives restarts; applied to the overlay now and pushed to the
         # dashboard via emit_appearance() on load. Default matches the UI swatch.
         self.accent_color = _normalize_hex_color(self.settings.get("accent_color"))
-        self.stroke_width = (
-            _bounded_number(self.settings.get("stroke_width", 6), int, 1, 20) or 6
-        )
+        self.stroke_width = _bounded_number(self.settings.get("stroke_width", 6), int, 1, 20) or 6
         self.overlay.set_accent_color(self.accent_color)
         self.overlay.set_stroke_width(self.stroke_width)
 
@@ -1329,7 +1273,7 @@ class AudioRadarApp(QMainWindow):
                 app.screenAdded.connect(self._on_screen_added)
                 app.screenRemoved.connect(self._on_screen_removed)
                 app.primaryScreenChanged.connect(self._on_primary_screen_changed)
-            except (AttributeError, TypeError):
+            except AttributeError, TypeError:
                 logger.debug("screen topology signals unavailable", exc_info=True)
             for screen in app.screens():
                 self._watch_screen_geometry(screen)
@@ -1405,7 +1349,7 @@ class AudioRadarApp(QMainWindow):
 
     def _freeze_dashboard_if_hidden(self):
         """Freeze WebEngine only if the dashboard stayed hidden/minimized."""
-        if self._closing_for_exit or self.isVisible() and not self.isMinimized():
+        if self._closing_for_exit or (self.isVisible() and not self.isMinimized()):
             return
         self._set_dashboard_frozen(True)
 
@@ -1451,10 +1395,7 @@ class AudioRadarApp(QMainWindow):
         runner = getattr(page, "runJavaScript", None)
         if runner is not None:
             try:
-                runner(
-                    "if (window.setDashboardFrozen) "
-                    f"window.setDashboardFrozen({'true' if frozen else 'false'});"
-                )
+                runner(f"if (window.setDashboardFrozen) window.setDashboardFrozen({'true' if frozen else 'false'});")
             except Exception:
                 logger.debug("dashboard refresh scheduler sync skipped", exc_info=True)
         if not frozen:
@@ -1485,16 +1426,10 @@ class AudioRadarApp(QMainWindow):
             return
         try:
             frozen = bool(getattr(self, "_dashboard_frozen", False))
-            runner(
-                "if (window.setDashboardFrozen) "
-                f"window.setDashboardFrozen({'true' if frozen else 'false'});"
-            )
+            runner(f"if (window.setDashboardFrozen) window.setDashboardFrozen({'true' if frozen else 'false'});")
             if frozen:
                 return
-            runner(
-                "if (typeof drawPreview === 'function') "
-                "window.requestAnimationFrame(drawPreview);"
-            )
+            runner("if (typeof drawPreview === 'function') window.requestAnimationFrame(drawPreview);")
             self._log_dashboard_metrics(page)
         except Exception:
             logger.debug("dashboard preview redraw skipped", exc_info=True)
@@ -1520,6 +1455,7 @@ class AudioRadarApp(QMainWindow):
             "fonts:document.fonts&&document.fonts.status}); })()"
         )
         try:
+
             def report(value):
                 logger.info("dashboard metrics=%s", value)
                 try:
@@ -1534,11 +1470,11 @@ class AudioRadarApp(QMainWindow):
                             browser_dpr,
                             value,
                         )
-                except (TypeError, ValueError, AttributeError, RuntimeError):
+                except TypeError, ValueError, AttributeError, RuntimeError:
                     return
 
             runner(script, report)
-        except (TypeError, RuntimeError):
+        except TypeError, RuntimeError:
             # Test doubles and older bindings may expose only the one-argument
             # overload; diagnostics must never affect rendering.
             return
@@ -1606,21 +1542,21 @@ class AudioRadarApp(QMainWindow):
                 )
                 if _debug_logging:
                     runner(
-                    "JSON.stringify((() => {"
-                    "const c=document.getElementById('preview-canvas');"
-                    "const a=document.getElementById('app');"
-                    "const cr=c?.getBoundingClientRect();"
-                    "const ar=a?.getBoundingClientRect();"
-                    "const cs=a?getComputedStyle(a):null;"
-                    "return {dpr:window.devicePixelRatio,"
-                    "visualScale:window.visualViewport?.scale||1,"
-                    "innerWidth:window.innerWidth,innerHeight:window.innerHeight,"
-                    "clientWidth:document.documentElement.clientWidth,"
-                    "clientHeight:document.documentElement.clientHeight,"
-                    "appRect:ar?{x:ar.x,y:ar.y,w:ar.width,h:ar.height}:null,"
-                    "canvasRect:cr?{x:cr.x,y:cr.y,w:cr.width,h:cr.height}:null,"
-                    "canvasBitmap:c?{w:c.width,h:c.height}:null,"
-                    "appFont:cs?cs.fontFamily:null};})())",
+                        "JSON.stringify((() => {"
+                        "const c=document.getElementById('preview-canvas');"
+                        "const a=document.getElementById('app');"
+                        "const cr=c?.getBoundingClientRect();"
+                        "const ar=a?.getBoundingClientRect();"
+                        "const cs=a?getComputedStyle(a):null;"
+                        "return {dpr:window.devicePixelRatio,"
+                        "visualScale:window.visualViewport?.scale||1,"
+                        "innerWidth:window.innerWidth,innerHeight:window.innerHeight,"
+                        "clientWidth:document.documentElement.clientWidth,"
+                        "clientHeight:document.documentElement.clientHeight,"
+                        "appRect:ar?{x:ar.x,y:ar.y,w:ar.width,h:ar.height}:null,"
+                        "canvasRect:cr?{x:cr.x,y:cr.y,w:cr.width,h:cr.height}:null,"
+                        "canvasBitmap:c?{w:c.width,h:c.height}:null,"
+                        "appFont:cs?cs.fontFamily:null};})())",
                         lambda value: logger.debug("dashboard viewport=%s", value),
                     )
         except Exception:
@@ -1634,7 +1570,7 @@ class AudioRadarApp(QMainWindow):
         try:
             handle.screenChanged.connect(self._on_dashboard_screen_changed)
             self._dashboard_window_handle = handle
-        except (AttributeError, TypeError):
+        except AttributeError, TypeError:
             logger.debug("dashboard screenChanged signal unavailable", exc_info=True)
 
     def showEvent(self, event):
@@ -1654,7 +1590,7 @@ class AudioRadarApp(QMainWindow):
                 screen.name() if screen else None,
                 float(screen.devicePixelRatio()) if screen else 0.0,
             )
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        except AttributeError, RuntimeError, TypeError, ValueError:
             logger.debug("dashboard display metrics unavailable", exc_info=True)
         if _debug_logging:
             try:
@@ -1667,7 +1603,7 @@ class AudioRadarApp(QMainWindow):
                     screen.name() if screen else None,
                     screen.geometry().getRect() if screen else None,
                 )
-            except (AttributeError, RuntimeError, TypeError):
+            except AttributeError, RuntimeError, TypeError:
                 logger.debug("dashboard Qt metrics unavailable", exc_info=True)
 
     def changeEvent(self, event):
@@ -1790,9 +1726,7 @@ class AudioRadarApp(QMainWindow):
         self.overlay.hide()
         self._stop_audio_consumption()
         if self.radar_operation_state in ("starting", "running"):
-            self._set_operation_state(
-                "restarting" if self._restart_requested else "stopping"
-            )
+            self._set_operation_state("restarting" if self._restart_requested else "stopping")
             self.audio_thread.request_stop()
 
     def _new_audio_thread(self):
@@ -1886,7 +1820,7 @@ class AudioRadarApp(QMainWindow):
         screens = QApplication.screens()
         try:
             idx = int(idx)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return
         if not screens or not 0 <= idx < len(screens):
             logger.warning("invalid monitor index ignored index=%r", idx)
@@ -1985,9 +1919,7 @@ class AudioRadarApp(QMainWindow):
     def set_mono_enabled(self, enabled: bool):
         enabled = bool(enabled)
         changed = enabled != self.mono_enabled
-        logger.info(
-            "mono output enabled changed from=%s to=%s", self.mono_enabled, enabled
-        )
+        logger.info("mono output enabled changed from=%s to=%s", self.mono_enabled, enabled)
         self.mono_enabled = enabled
         self.settings["mono_enabled"] = self.mono_enabled
         self._queue_settings_save()
@@ -1998,9 +1930,7 @@ class AudioRadarApp(QMainWindow):
     def set_mono_output(self, device: str):
         device = device or None
         changed = device != self.mono_device
-        logger.info(
-            "mono output device changed from=%s to=%s", self.mono_device, device
-        )
+        logger.info("mono output device changed from=%s to=%s", self.mono_device, device)
         self.mono_device = device
         self.settings["mono_device"] = self.mono_device
         self._queue_settings_save()
@@ -2057,9 +1987,7 @@ class AudioRadarApp(QMainWindow):
         doesn't bundle it, open the official download page instead. The installer
         shows its own UI on purpose (donationware terms + trust for the
         anti-cheat-wary audience)."""
-        installer = os.path.join(
-            RESOURCE_DIR, "vendor", "VBCABLE", "VBCABLE_Setup_x64.exe"
-        )
+        installer = os.path.join(RESOURCE_DIR, "vendor", "VBCABLE", "VBCABLE_Setup_x64.exe")
         if os.path.exists(installer):
             try:
                 import ctypes
@@ -2151,9 +2079,7 @@ class AudioRadarApp(QMainWindow):
 
     def set_audio_params(self, updates):
         """Validate and apply one atomic group of runtime audio parameters."""
-        if not isinstance(updates, dict) or any(
-            key not in AUDIO_PARAM_LIMITS for key in updates
-        ):
+        if not isinstance(updates, dict) or any(key not in AUDIO_PARAM_LIMITS for key in updates):
             logger.warning("invalid audio parameter update ignored keys=%r", updates)
             return False
         normalized = dict(self.audio_settings)
@@ -2161,9 +2087,7 @@ class AudioRadarApp(QMainWindow):
             cast, minimum, maximum = AUDIO_PARAM_LIMITS[key]
             value = _bounded_number(updates[key], cast, minimum, maximum)
             if value is None:
-                logger.warning(
-                    "invalid audio parameter ignored key=%s value=%r", key, updates[key]
-                )
+                logger.warning("invalid audio parameter ignored key=%s value=%r", key, updates[key])
                 return False
             normalized[key] = value
         if normalized["freq_low"] > normalized["freq_high"]:
@@ -2253,9 +2177,7 @@ class AudioRadarApp(QMainWindow):
         # Resolve the capture target fresh (PIDs change between launches).
         pid, name = self._resolve_target()
         self.audio_thread.set_target(pid, name)
-        self._capture_label = (
-            name if pid is not None else (self.selected_program or "system audio")
-        )
+        self._capture_label = name if pid is not None else (self.selected_program or "system audio")
         self.audio_thread.set_mono(self.mono_enabled, self.mono_device)
         self._apply_audio_settings_to_thread()
         self.audio_thread.clear_latest_audio()
@@ -2278,9 +2200,7 @@ class AudioRadarApp(QMainWindow):
         previous = self.radar_operation_state
         self.radar_operation_state = state
         logger.info("operation state %s -> %s", previous, state)
-        self.bridge.operationBusyChanged.emit(
-            state in ("starting", "restarting", "stopping", "closing")
-        )
+        self.bridge.operationBusyChanged.emit(state in ("starting", "restarting", "stopping", "closing"))
         self.bridge.operationStateChanged.emit(state)
 
     def _on_capture_ready(self):
@@ -2301,9 +2221,7 @@ class AudioRadarApp(QMainWindow):
         self.radar_active = True
         self._set_operation_state("running")
         if self.selected_program and self._capture_label != "system audio":
-            self.bridge.statusChanged.emit(
-                f"Radar active - capturing {self._capture_label}", True
-            )
+            self.bridge.statusChanged.emit(f"Radar active - capturing {self._capture_label}", True)
         else:
             self.bridge.statusChanged.emit("Radar is active", True)
 
@@ -2312,14 +2230,8 @@ class AudioRadarApp(QMainWindow):
             return
         if self._watchdog_generation != self._active_capture_generation:
             return
-        label = (
-            getattr(self, "_capture_label", None)
-            or self.selected_program
-            or "system audio"
-        )
-        self._capture_terminal_error = (
-            f"Capture of {label} stopped unexpectedly - restart the radar"
-        )
+        label = getattr(self, "_capture_label", None) or self.selected_program or "system audio"
+        self._capture_terminal_error = f"Capture of {label} stopped unexpectedly - restart the radar"
         logger.error("%s", self._capture_terminal_error)
         self.radar_active = False
         self.overlay.hide()
@@ -2365,9 +2277,7 @@ class AudioRadarApp(QMainWindow):
         self._restart_requested = False
         self._set_operation_state("idle")
         message = terminal_error or (
-            "Capture stopped unexpectedly - restart the radar"
-            if state in ("starting", "running")
-            else "Radar stopped"
+            "Capture stopped unexpectedly - restart the radar" if state in ("starting", "running") else "Radar stopped"
         )
         self._capture_terminal_error = None
         self.bridge.statusChanged.emit(message, False)
@@ -2465,7 +2375,7 @@ class AudioRadarApp(QMainWindow):
         """Clamp the full overlay rectangle inside the active work area."""
         try:
             x, y = int(x), int(y)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return self._selected_monitor_center_position()
         screens = QApplication.screens()
         if not screens:
@@ -2478,11 +2388,7 @@ class AudioRadarApp(QMainWindow):
                 None,
             )
         if screen is None:
-            screen = (
-                screens[self.selected_monitor]
-                if 0 <= self.selected_monitor < len(screens)
-                else screens[0]
-            )
+            screen = screens[self.selected_monitor] if 0 <= self.selected_monitor < len(screens) else screens[0]
         geo = screen.availableGeometry()
         max_x = max(geo.x(), geo.right() - self.overlay.width() + 1)
         max_y = max(geo.y(), geo.bottom() - self.overlay.height() + 1)
@@ -2503,7 +2409,7 @@ class AudioRadarApp(QMainWindow):
             if signal is not None:
                 try:
                     signal.connect(self._on_screen_geometry_changed)
-                except (AttributeError, TypeError):
+                except AttributeError, TypeError:
                     logger.debug("unable to watch QScreen.%s", signal_name, exc_info=True)
 
     def _on_screen_added(self, screen):
@@ -2533,8 +2439,7 @@ class AudioRadarApp(QMainWindow):
             return
         if self._selected_monitor_name:
             matching = next(
-                (i for i, screen in enumerate(screens)
-                 if screen.name() == self._selected_monitor_name),
+                (i for i, screen in enumerate(screens) if screen.name() == self._selected_monitor_name),
                 None,
             )
             if matching is not None:
@@ -2552,8 +2457,7 @@ class AudioRadarApp(QMainWindow):
         bridge = getattr(self, "bridge", None)
         if bridge is not None and not getattr(self, "_dashboard_frozen", False):
             monitors = [
-                {"idx": i, "name": s.name(),
-                 "resolution": f"{s.geometry().width()}x{s.geometry().height()}"}
+                {"idx": i, "name": s.name(), "resolution": f"{s.geometry().width()}x{s.geometry().height()}"}
                 for i, s in enumerate(screens)
             ]
             bridge.monitorsChanged.emit(json.dumps(monitors))
@@ -2574,7 +2478,7 @@ class AudioRadarApp(QMainWindow):
         try:
             x = int(pos["x"])
             y = int(pos["y"])
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return False
         width = self.overlay.width()
         height = self.overlay.height()
@@ -2590,18 +2494,14 @@ class AudioRadarApp(QMainWindow):
     def _place_overlay_for_start(self):
         pos = self.settings.get("overlay_position")
         screens = QApplication.screens()
-        selected = (
-            screens[self.selected_monitor]
-            if screens and 0 <= self.selected_monitor < len(screens)
-            else None
-        )
+        selected = screens[self.selected_monitor] if screens and 0 <= self.selected_monitor < len(screens) else None
         saved_on_selected = False
         if selected is not None and isinstance(pos, dict):
             try:
                 px, py = int(pos["x"]), int(pos["y"])
                 center = (px + self.overlay.width() // 2, py + self.overlay.height() // 2)
                 saved_on_selected = selected.geometry().contains(*center)
-            except (KeyError, TypeError, ValueError, OverflowError):
+            except KeyError, TypeError, ValueError, OverflowError:
                 saved_on_selected = False
         if saved_on_selected and self._saved_overlay_position_is_visible(pos):
             x, y = self._clamp_overlay_position(pos["x"], pos["y"], selected)
@@ -2698,9 +2598,7 @@ class AudioRadarApp(QMainWindow):
 
         if hasattr(self, "hotkey_controller"):
             self.hotkey_controller.filter.unregister()
-            QApplication.instance().removeNativeEventFilter(
-                self.hotkey_controller.filter
-            )
+            QApplication.instance().removeNativeEventFilter(self.hotkey_controller.filter)
 
         self._flush_pending_saves()
         self._dashboard_freeze_timer.stop()
@@ -2836,9 +2734,7 @@ if __name__ == "__main__":
         try:
             import ctypes
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "VisualAudioOverlay.App"
-            )
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VisualAudioOverlay.App")
         except Exception as exc:  # noqa: BLE001 - Windows shell integration is optional.
             logger.debug("AppUserModelID setup failed: %s", exc)
 
@@ -2848,15 +2744,11 @@ if __name__ == "__main__":
     # visible in QtWebEngine: Chromium allocates a backing surface for the
     # rounded DPR and Windows then stretches it to the actual monitor, making
     # text look soft and leaving CSS geometry one or two pixels out of phase.
-    # This must be set before QApplication is constructed.
-    try:
-        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-        )
-    except (AttributeError, TypeError):
-        # Older Qt 6 builds may not expose the policy; their default policy is
-        # still preferable to preventing the dashboard from starting.
-        pass
+    # This must be set before QApplication is constructed. Older Qt 6 builds may
+    # not expose the policy; their default policy is still preferable to
+    # preventing the dashboard from starting.
+    with contextlib.suppress(AttributeError, TypeError):
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(qt_args)
     primary_screen = app.primaryScreen()
     if primary_screen is not None:

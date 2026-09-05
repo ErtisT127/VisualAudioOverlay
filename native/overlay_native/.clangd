@@ -1,0 +1,7 @@
+CompileFlags:
+  # The local compile_commands.json is MinGW-generated (see build/), but
+  # clangd's default Windows target is MSVC. Without the GNU target, MinGW's
+  # _mingw.h errors out (__MINGW32__ never defined), so pin the target that
+  # matches the toolchain which produced the database.
+  CompilationDatabase: build
+  Add: [--target=x86_64-w64-windows-gnu]

@@ -1,0 +1,19 @@
+{
+  "name": "visual-audio-overlay",
+  "version": "0.2.3",
+  "private": true,
+  "packageManager": "pnpm@11.3.0",
+  "scripts": {
+    "lint": "eslint .",
+    "lint:ci": "eslint --quiet .",
+    "format": "prettier --write \"dashboard_v2/**/*.{js,html,css}\" \"tests/**/*.js\"",
+    "format:check": "prettier --check \"dashboard_v2/**/*.{js,html,css}\" \"tests/**/*.js\"",
+    "test": "node tests/test_dropdowns.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "eslint": "^9.39.0",
+    "globals": "^14.0.0",
+    "prettier": "^3.6.0"
+  }
+}

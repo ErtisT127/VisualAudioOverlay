@@ -17,6 +17,9 @@ __pycache__/
 venv/
 env/
 
+# Node dependencies
+node_modules/
+
 # Application and native build output
 dist/
 build/
@@ -26,6 +29,10 @@ native/**/*.lib
 native/**/*.exp
 native/**/*.obj
 native/**/*.pdb
+
+# Local tooling
+AGENTS.md
+CLAUDE.md
 
 # Editor and operating-system files
 .idea/

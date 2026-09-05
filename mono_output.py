@@ -79,11 +79,7 @@ def output_device_state() -> dict:
         logger.warning("default output lookup failed: %s", exc)
         default = None
     cable = next(
-        (
-            name
-            for name in devices
-            if any(hint in name.lower() for hint in _CABLE_HINTS)
-        ),
+        (name for name in devices if any(hint in name.lower() for hint in _CABLE_HINTS)),
         None,
     )
     return {"devices": devices, "default": default, "cable": cable}
@@ -147,9 +143,7 @@ class MonoMixThread(QThread):
                 logger.error("mono playback unavailable: no output device")
                 self.failed.emit("no output device for mono playback")
                 return
-            with speaker.player(
-                samplerate=self.samplerate, channels=self.out_channels
-            ) as player:
+            with speaker.player(samplerate=self.samplerate, channels=self.out_channels) as player:
                 while self._running:
                     try:
                         chunk = self._q.get(timeout=0.2)
@@ -165,10 +159,7 @@ class MonoMixThread(QThread):
         across the output channels so it plays in both cups - whichever ear is
         the working one hears the full mix. 0.5-style averaging (mean) keeps the
         level from clipping versus a raw sum."""
-        if data.ndim == 1:
-            mono = data
-        else:
-            mono = data.mean(axis=1, dtype=np.float32)
+        mono = data if data.ndim == 1 else data.mean(axis=1, dtype=np.float32)
         mono = np.asarray(mono, dtype=np.float32)
         out = np.empty((len(mono), self.out_channels), dtype=np.float32)
         out[:] = mono[:, None]

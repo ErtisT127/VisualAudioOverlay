@@ -1,0 +1,57 @@
+# Full local check set. CI runs a narrower critical subset via -checks on the
+# command line (see scripts/lint_native.ps1), so this file stays permissive.
+#
+# Excluded checks are noisy on this Win32/COM/D3D codebase:
+#   * raw pointer arithmetic / reinterpret_cast when walking packed audio
+#     buffers, COM vtables, and GWLP_USERDATA-encoded HWND state;
+#   * window styles are signed LONG_PTR by API definition, so bitwise ops trip
+#     signed-bitwise on every GetWindowLongPtrW call;
+#   * misc-include-cleaner misfires on the transitive MinGW/Windows headers
+#     (DWORD, MARGINS, TRUE reported as "not directly included");
+#   * k* named constants defeat avoid-magic-numbers; WS_EX_* fallback #define
+#     defeats macro-usage;
+#   * the public C-ABI enum in overlay_native.h must stay unscoped for ctypes;
+#   * Overlay is a unique-ownership impl detail (mutex/thread/ComPtr members);
+#   * set_geometry-style APIs trip easily-swappable-parameters on every call;
+#   * scoped_lock/lock_guard are equivalent; braces/implicit-bool are LLVM
+#     upstream's own style and would churn 50+ sites for no defect;
+#   * misc-const-correctness is a rewrite engine, not a lint.
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  misc-*,
+  readability-braces-around-statements,
+  readability-container-size-empty,
+  readability-delete-null-pointer,
+  readability-misleading-indentation,
+  readability-redundant-control-flow,
+  readability-simplify-boolean-expr,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-signed-bitwise,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-narrowing-conversions,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-special-member-functions,
+  -cppcoreguidelines-use-enum-class,
+  -misc-const-correctness,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-auto,
+  -modernize-use-scoped-lock,
+  -modernize-use-trailing-return-type,
+  -performance-no-int-to-ptr,
+  -portability-avoid-pragma-once,
+  -readability-braces-around-statements,
+  -readability-implicit-bool-conversion

@@ -8,7 +8,8 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078D6">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-3776AB">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.14-3776AB">
+  <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ErtisT127/VisualAudioOverlay/ci.yml?label=CI">
   <img alt="License" src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange">
 </p>
@@ -113,17 +114,28 @@ virtual audio cable, which the app then reads. We use **VB-CABLE** for this.
 ```bash
 git clone https://github.com/ErtisT127/VisualAudioOverlay.git
 cd VisualAudioOverlay
-pip install -r requirements.txt -r requirements-build.txt
-cmake -S native/overlay_native -B native/overlay_native/build -G "MinGW Makefiles"
-cmake --build native/overlay_native/build --config Release --parallel
-python main.py
+uv sync --group dev --group build   # dev = ruff + pytest, build = nuitka
+bash scripts/build_native.sh        # overlay_native.dll via MinGW
+uv run python main.py
 ```
 
-For a one-file build:
+The dashboard is plain browser JavaScript with no bundling, so `pnpm install`
+is only needed when working on its lint tooling.
+
+### One-file executable
 
 ```bash
-bash scripts/build_nuitka.sh
+./scripts/build_nuitka.sh            # MSVC backend; --zig fallback when no Visual Studio
 ```
+
+### Local quality gate
+
+```bash
+./scripts/check.sh
+```
+
+Runs the full ruff set + pytest, prettier + eslint + node tests, and the
+complete clang-tidy set against the local compile database.
 
 ## License
 

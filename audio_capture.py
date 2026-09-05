@@ -50,9 +50,7 @@ class AudioCaptureThread(QThread):
         self.gain = gain
         self.freq_low = freq_low
         self.freq_high = freq_high
-        self.max_amplitude = (
-            max_amplitude  # ignore sounds louder than this (1.0 = no limit)
-        )
+        self.max_amplitude = max_amplitude  # ignore sounds louder than this (1.0 = no limit)
         self.running = True
         self.samplerate = 48000
         # When target_pid is set, capture only that program (and its children)
@@ -77,9 +75,7 @@ class AudioCaptureThread(QThread):
             "max_mailbox_age_ms": 0.0,
         }
         self._metrics_enabled = (
-            os.environ.get(LOG_DEBUG_ENV) == "1"
-            if metrics_enabled is None
-            else bool(metrics_enabled)
+            os.environ.get(LOG_DEBUG_ENV) == "1" if metrics_enabled is None else bool(metrics_enabled)
         )
         self._shared_params = shared_params or mp.get_context("spawn").Array(
             "d", [sensitivity, gain, freq_low, freq_high, max_amplitude]
@@ -152,9 +148,7 @@ class AudioCaptureThread(QThread):
         self._shared_params[4] = max_amp
 
     def _user_failure_message(self):
-        label = self.target_name or (
-            f"PID {self.target_pid}" if self.target_pid else "system audio"
-        )
+        label = self.target_name or (f"PID {self.target_pid}" if self.target_pid else "system audio")
         return f"Capture of {label} stopped unexpectedly - restart the radar"
 
     def run(self):
@@ -196,9 +190,7 @@ class AudioCaptureThread(QThread):
         }
         ctx = mp.get_context("spawn")
         recv_conn, send_conn = ctx.Pipe(duplex=False)
-        proc = ctx.Process(
-            target=_capture_worker_entry, args=(send_conn, config), daemon=True
-        )
+        proc = ctx.Process(target=_capture_worker_entry, args=(send_conn, config), daemon=True)
         self._process = proc
         self._recv_conn = recv_conn
         try:
@@ -234,12 +226,11 @@ class AudioCaptureThread(QThread):
                             break
                 elif not proc.is_alive():
                     break
-        except (EOFError, OSError):
+        except EOFError, OSError:
             pass
         finally:
             logger.debug(
-                "capture manager cleaning up running=%s worker_alive=%s "
-                "received_ready=%s received_error=%s",
+                "capture manager cleaning up running=%s worker_alive=%s received_ready=%s received_error=%s",
                 self.running,
                 proc.is_alive(),
                 received_ready,
@@ -247,16 +238,12 @@ class AudioCaptureThread(QThread):
             )
             if self.running and not received_ready and not received_error:
                 label = self.target_name or "system audio"
-                self.error_signal.emit(
-                    f"Capture of {label} stopped unexpectedly - restart the radar"
-                )
+                self.error_signal.emit(f"Capture of {label} stopped unexpectedly - restart the radar")
             if proc.is_alive():
                 proc.terminate()
             proc.join(timeout=1.0)
             if proc.is_alive():
-                logger.warning(
-                    "capture worker ignored terminate; forcing kill pid=%s", proc.pid
-                )
+                logger.warning("capture worker ignored terminate; forcing kill pid=%s", proc.pid)
                 proc.kill()
                 proc.join(timeout=1.0)
             if proc.is_alive():
@@ -265,9 +252,7 @@ class AudioCaptureThread(QThread):
             self._process = None
             self._recv_conn = None
             if self._metrics_enabled:
-                logger.debug(
-                    "capture performance metrics=%s", self.performance_metrics()
-                )
+                logger.debug("capture performance metrics=%s", self.performance_metrics())
             logger.debug("capture manager cleanup complete")
 
     def _handle_manager_message(self, message):
@@ -295,16 +280,10 @@ class AudioCaptureThread(QThread):
         try:
             from mono_output import MonoMixThread
 
-            self._mono = MonoMixThread(
-                device_name=self.mono_device, samplerate=self.samplerate
-            )
-            self._mono.failed.connect(
-                lambda msg: logger.error("Mono output error: %s", msg)
-            )
+            self._mono = MonoMixThread(device_name=self.mono_device, samplerate=self.samplerate)
+            self._mono.failed.connect(lambda msg: logger.error("Mono output error: %s", msg))
             self._mono.start()
-            logger.info(
-                "Mono output started device=%s", self.mono_device or "default device"
-            )
+            logger.info("Mono output started device=%s", self.mono_device or "default device")
         except Exception as e:  # noqa: BLE001 - optional mono output must degrade gracefully.
             logger.warning("Mono output unavailable; continuing without it: %s", e)
             self._mono = None
@@ -334,9 +313,7 @@ class AudioCaptureThread(QThread):
             self.error_signal.emit(message)
             return
 
-        cap = ProcessLoopbackCapture(
-            self.target_pid, samplerate=self.samplerate, channels=2
-        )
+        cap = ProcessLoopbackCapture(self.target_pid, samplerate=self.samplerate, channels=2)
         try:
             cap.start()
         except Exception:
@@ -418,8 +395,7 @@ class AudioCaptureThread(QThread):
                 use_surround = False
                 if raw_channels >= 6:
                     surround_max = max(
-                        float(np.max(np.abs(first_data[:, ch])))
-                        for ch in range(2, min(raw_channels, 6))
+                        float(np.max(np.abs(first_data[:, ch]))) for ch in range(2, min(raw_channels, 6))
                     )
                     if surround_max > 0.0001:
                         use_surround = True
@@ -501,7 +477,7 @@ def _capture_worker_entry(send_conn, config):
     def send(message):
         try:
             send_conn.send(message)
-        except (BrokenPipeError, EOFError, OSError):
+        except BrokenPipeError, EOFError, OSError:
             capture.running = False
 
     capture.audio_data_signal.connect(lambda a, i: send(("audio", a, i)))

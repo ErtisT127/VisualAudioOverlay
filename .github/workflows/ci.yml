@@ -5,48 +5,107 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Only the newest run per branch/PR is kept; superseded runs cancel in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  pipeline:
-    name: Check, test, and build
+  # Fast gate for every push/PR: Python ruff+pytest, dashboard prettier+eslint+
+  # node tests, native clang-tidy on the critical subset. Lint errors surface as
+  # inline PR annotations (ruff github format / eslint-annotate / lint_native -Ci).
+  checks:
+    name: Lint, format, and test
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up uv and Python 3.14
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
+          cache-dependency-glob: uv.lock
 
-      - name: Install formatter and linter
-        run: python -m pip install ruff==0.16.5
+      - name: Install Python dependencies
+        run: uv sync --frozen --group dev
 
       - name: Verify Python formatting
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Block fatal Python errors
-        run: ruff check --select E9,F63,F7,F82 .
-
-      - name: Install application, test, and build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install -r requirements-build.txt pytest
+        run: uv run ruff check --select E9,F63,F7,F82 --output-format github .
 
       - name: Run Python tests
-        run: python -m pytest tests -q
+        run: uv run pytest tests -q
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: pnpm
+
+      - name: Install dashboard dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify dashboard formatting
+        run: pnpm format:check
+
+      - name: Lint dashboard (inline annotations)
+        run: node scripts/ci/eslint-annotate.mjs
 
       - name: Run dashboard tests
-        run: node tests/test_dropdowns.js
+        run: pnpm test
 
+      # clang-cl needs a vcvars-initialized shell to find the MSVC STL/SDK
+      # headers, so this must come before the CMake configure below.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Configure only (no build): a Ninja compile db is what clang-tidy lints
+      # against. Separate build-lint/ dir keeps it clear of real builds.
+      - name: Configure clang-cl compile database
+        run: cmake -S native/overlay_native -B native/overlay_native/build-lint -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Lint native (critical subset, inline annotations)
+        shell: pwsh
+        run: ./scripts/lint_native.ps1 -Ci -BuildDir native/overlay_native/build-lint
+
+  # Full onefile Nuitka packaging. Expensive (~10-20 min), so it only runs on
+  # main pushes (after checks pass) or manual dispatch; PRs never pay for it.
+  build:
+    name: Build onefile executable
+    runs-on: windows-latest
+    timeout-minutes: 90
+    needs: checks
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.14
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+          cache-dependency-glob: uv.lock
+
+      - name: Install build dependencies
+        run: uv sync --frozen --group build
+
+      # MSVC end to end: native DLL via the Visual Studio generator, then Nuitka
+      # --msvc. Both locate VS themselves; no vcvars step needed here.
       - name: Build executable
         shell: pwsh
-        run: ./scripts/build_nuitka.ps1
+        run: ./scripts/build_nuitka.ps1 -NativeToolchain msvc -CCompiler msvc
 
       - name: Upload executable
         uses: actions/upload-artifact@v4

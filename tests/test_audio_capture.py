@@ -21,9 +21,7 @@ def capture_with(*, sensitivity=0.005, gain=1.0, max_amplitude=1.0):
 
 def emitted_audio(capture, data):
     received = []
-    capture.audio_data_signal.connect(
-        lambda angle, level: received.append((angle, level))
-    )
+    capture.audio_data_signal.connect(lambda angle, level: received.append((angle, level)))
     capture._process_chunk(data, use_surround=False)
     return received
 

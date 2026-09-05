@@ -297,9 +297,7 @@ class ProcessLoopbackCapture:
         params = AUDIOCLIENT_ACTIVATION_PARAMS()
         params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
         params.ProcessLoopbackParams.TargetProcessId = self.pid
-        params.ProcessLoopbackParams.ProcessLoopbackMode = (
-            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
-        )
+        params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
 
         pv = PROPVARIANT()
         pv.vt = VT_BLOB
@@ -317,9 +315,7 @@ class ProcessLoopbackCapture:
             byref(op),
         )
         if hr != 0:
-            raise RuntimeError(
-                f"ActivateAudioInterfaceAsync HRESULT 0x{hr & 0xFFFFFFFF:08X}"
-            )
+            raise RuntimeError(f"ActivateAudioInterfaceAsync HRESULT 0x{hr & 0xFFFFFFFF:08X}")
         if not op:
             raise RuntimeError("ActivateAudioInterfaceAsync returned no operation")
         # `params`/`pv` must outlive the call above; they do (locals held to here).
@@ -329,9 +325,7 @@ class ProcessLoopbackCapture:
 
         activate_hr, unknown = op.GetActivateResult()
         if activate_hr != 0:
-            raise RuntimeError(
-                f"GetActivateResult HRESULT 0x{activate_hr & 0xFFFFFFFF:08X}"
-            )
+            raise RuntimeError(f"GetActivateResult HRESULT 0x{activate_hr & 0xFFFFFFFF:08X}")
         return unknown.QueryInterface(IAudioClient)
 
     def _init_stream(self, client: IAudioClient):
@@ -392,9 +386,7 @@ class ProcessLoopbackCapture:
                     break
                 wait_result = _kernel32.WaitForSingleObject(event, 50)
                 if wait_result == WAIT_FAILED:
-                    raise OSError(
-                        ctypes.get_last_error(), "audio capture event wait failed"
-                    )
+                    raise OSError(ctypes.get_last_error(), "audio capture event wait failed")
                 if wait_result == WAIT_TIMEOUT:
                     self._wait_timeouts += 1
                     break
@@ -423,9 +415,7 @@ class ProcessLoopbackCapture:
                     else:
                         fptr = ctypes.cast(data_ptr, POINTER(ctypes.c_float))
                         arr = (
-                            np.ctypeslib.as_array(
-                                fptr, shape=(nframes * self.channels,)
-                            )
+                            np.ctypeslib.as_array(fptr, shape=(nframes * self.channels,))
                             .reshape(nframes, self.channels)
                             .copy()
                         )
@@ -481,26 +471,20 @@ def _sessions_all_render_devices():
     from pycaw.constants import DEVICE_STATE, CLSID_MMDeviceEnumerator, EDataFlow
     from pycaw.utils import AudioSession
 
-    enumerator = comtypes.CoCreateInstance(
-        CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER
-    )
-    devices = enumerator.EnumAudioEndpoints(
-        EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value
-    )
+    enumerator = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER)
+    devices = enumerator.EnumAudioEndpoints(EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
 
     for i in range(devices.GetCount()):
         dev = devices.Item(i)
         if dev is None:
             continue
         try:
-            mgr = dev.Activate(
-                IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None
-            ).QueryInterface(IAudioSessionManager2)
+            mgr = dev.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None).QueryInterface(
+                IAudioSessionManager2
+            )
             session_enum = mgr.GetSessionEnumerator()
         except Exception as exc:  # noqa: BLE001 - endpoint enumeration is best effort.
-            logger.debug(
-                "audio session manager unavailable for endpoint %s: %s", i, exc
-            )
+            logger.debug("audio session manager unavailable for endpoint %s: %s", i, exc)
             continue  # some endpoints refuse a session manager - skip them
         for j in range(session_enum.GetCount()):
             ctl = session_enum.GetSession(j)
@@ -509,9 +493,7 @@ def _sessions_all_render_devices():
             try:
                 ctl2 = ctl.QueryInterface(IAudioSessionControl2)
             except Exception as exc:  # noqa: BLE001 - session metadata is optional.
-                logger.debug(
-                    "audio session query failed endpoint=%s session=%s: %s", i, j, exc
-                )
+                logger.debug("audio session query failed endpoint=%s session=%s: %s", i, j, exc)
                 continue
             if ctl2 is not None:
                 yield AudioSession(ctl2)
@@ -531,9 +513,7 @@ def list_audio_programs() -> list[dict]:
     try:
         sessions = list(_sessions_all_render_devices())
     except Exception as exc:  # noqa: BLE001 - endpoint enumeration is best effort.
-        logger.warning(
-            "all-endpoint audio enumeration failed; using default endpoint: %s", exc
-        )
+        logger.warning("all-endpoint audio enumeration failed; using default endpoint: %s", exc)
         # Fall back to the default-device-only enumeration if the multi-device
         # scan fails for any reason, so the dropdown never goes empty.
         try:
@@ -566,10 +546,7 @@ def list_audio_programs() -> list[dict]:
             continue
         found.setdefault(friendly, process_id)
 
-    return [
-        {"name": k, "pid": v}
-        for k, v in sorted(found.items(), key=lambda kv: kv[0].lower())
-    ]
+    return [{"name": k, "pid": v} for k, v in sorted(found.items(), key=lambda kv: kv[0].lower())]
 
 
 def resolve_pid(program_name: str) -> int | None:

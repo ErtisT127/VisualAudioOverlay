@@ -55,14 +55,11 @@ def configure_logging(
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
         from logging.handlers import RotatingFileHandler
 
-        handler = RotatingFileHandler(
-            log_path, maxBytes=2 * 1024 * 1024, backupCount=0, encoding="utf-8"
-        )
+        handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=0, encoding="utf-8")
         handler.setLevel(log_level)
         handler.setFormatter(
             logging.Formatter(
-                "%(asctime)s.%(msecs)03d %(levelname)s "
-                "[pid=%(process)d tid=%(thread)d] %(name)s: %(message)s",
+                "%(asctime)s.%(msecs)03d %(levelname)s [pid=%(process)d tid=%(thread)d] %(name)s: %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
             )
         )
