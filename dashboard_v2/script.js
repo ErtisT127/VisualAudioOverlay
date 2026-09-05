@@ -75,6 +75,7 @@ function initBridge() {
             bridge.deviceChanged.connect(onDeviceChanged);
             bridge.profilesChanged.connect(onProfilesChanged);
             bridge.monitorsChanged.connect(onMonitorsChanged);
+            if (bridge.selectedMonitorChanged) bridge.selectedMonitorChanged.connect(onSelectedMonitorChanged);
             bridge.presetsChanged.connect(onPresetsChanged);
             bridge.overlayPositionChanged.connect(onOverlayPositionChanged);
             // Optional new signals - only connect if the backend provides them.
@@ -105,7 +106,7 @@ function initBridge() {
             // blocking COM enumeration is what grew the list. See isSelectOpen.
             window.addEventListener("focus", () => {
                 if (isSelectOpen()) return;
-                AR.refreshPrograms();
+                AR.refreshDropdowns();
             });
 
             resolve();
@@ -295,6 +296,11 @@ function onDeviceChanged(label) {
 
 function onMonitorsChanged(jsonStr) {
     fillSelect("monitor-select", JSON.parse(jsonStr).map(m => ({ value: m.idx, label: m.name })));
+}
+
+function onSelectedMonitorChanged(idx) {
+    const sel = document.getElementById("monitor-select");
+    if (sel) sel.value = String(idx);
 }
 
 function onPresetsChanged(jsonStr) {
@@ -885,7 +891,36 @@ window.AR = {
     refreshPrograms() {
         // Re-enumerate live audio programs when the dropdown is opened, so the
         // game shows up even if it started playing after the app launched.
-        if (bridge.refresh_programs) bridge.refresh_programs();
+        const channel = window.bridge;
+        if (channel && channel.refresh_programs) channel.refresh_programs();
+    },
+
+    refreshMonitors() {
+        const channel = window.bridge;
+        if (channel && channel.refresh_monitors) channel.refresh_monitors();
+    },
+
+    refreshDropdown(id) {
+        if (window._dashboardFrozen || document.hidden) return;
+        const now = Date.now();
+        if (_lastDropdownRefresh[id] && now - _lastDropdownRefresh[id] < 250) {
+            resetDropdownRefreshTimer();
+            return;
+        }
+        _lastDropdownRefresh[id] = now;
+        if (id === "monitor-select") AR.refreshMonitors();
+        else if (id === "program-select") AR.refreshPrograms();
+        resetDropdownRefreshTimer();
+    },
+
+    refreshDropdowns() {
+        if (window._dashboardFrozen || document.hidden || isSelectOpen()) {
+            resetDropdownRefreshTimer();
+            return;
+        }
+        AR.refreshMonitors();
+        AR.refreshPrograms();
+        resetDropdownRefreshTimer();
     },
 
     // ── Mono output ────────────────────────────────────────────────
@@ -1023,15 +1058,42 @@ function applyProfileValues(p) {
 
 }
 
-// ── Preview canvas - mirrors overlay.py rendering ──────────────────────
-// overlay.py: faint white base circle + accent-coloured arc "blips",
+// ── Preview canvas - mirrors native overlay rendering ──────────────────────
+// native overlay: faint white base circle + accent-coloured arc "blips",
 // 35° span, round cap, stroke width = thickness. Here we draw one static
 // sample blip so the user sees the chosen colour + thickness style.
 function drawPreview() {
     const canvas = document.getElementById("preview-canvas");
     if (!canvas) return;
+    // A display-mode/DPI switch can discard Chromium's canvas backing store
+    // while leaving the DOM node alive. Keep the bitmap at the current CSS
+    // size × DPR so it is redrawn sharply after the compositor recreates its
+    // device (and do not rely on a stale 150x150 backing surface).
+    let cssWidth = canvas.clientWidth || canvas.width || 1;
+    let cssHeight = canvas.clientHeight || canvas.height || 1;
+    if (typeof canvas.getBoundingClientRect === "function") {
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width > 0) cssWidth = rect.width;
+        if (rect.height > 0) cssHeight = rect.height;
+    }
+    const dpr = Math.max(1, Number(window.devicePixelRatio) || 1);
+    const backingWidth = Math.max(1, Math.round(cssWidth * dpr));
+    const backingHeight = Math.max(1, Math.round(cssHeight * dpr));
+    if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+        canvas.width = backingWidth;
+        canvas.height = backingHeight;
+    }
     const ctx = canvas.getContext("2d");
-    const W = canvas.width, H = canvas.height;
+    // QtWebEngine may recreate the canvas backing surface after a frozen page
+    // is resumed.  There is nothing useful to draw until a 2D context exists;
+    // the visibility/pageshow hooks below will retry on the next frame.
+    if (!ctx) return;
+    // Draw in CSS pixels; the transform maps those coordinates to the DPR
+    // backing bitmap and keeps line widths consistent across monitors.
+    if (typeof ctx.setTransform === "function") {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    const W = cssWidth, H = cssHeight;
     const cx = W / 2, cy = H / 2;
     const radius = Math.min(W, H) / 2 * 0.8;
 
@@ -1084,6 +1146,45 @@ function strVal(id, def) { const el = document.getElementById(id); return el ? e
 // Rebuilds queued because their <select> was open at the time:
 // { id: {opts, preferred} }.
 const _pendingFills = {};
+
+// Dropdowns are refreshed on demand when opened, with a low-rate visible-page
+// poll as a backstop for monitor/program changes that happen while the panel is
+// idle.  The timer is deliberately stopped while the WebEngine page is hidden
+// or Frozen; opening a select then restarts the same idle interval.
+const DROPDOWN_REFRESH_IDLE_MS = 10000;
+let _dropdownRefreshTimer = null;
+const _lastDropdownRefresh = {};
+
+function stopDropdownRefreshTimer() {
+    if (_dropdownRefreshTimer !== null && typeof window.clearTimeout === "function") {
+        window.clearTimeout(_dropdownRefreshTimer);
+    }
+    _dropdownRefreshTimer = null;
+}
+
+function scheduleDropdownRefresh(delay = DROPDOWN_REFRESH_IDLE_MS) {
+    stopDropdownRefreshTimer();
+    if (window._dashboardFrozen || document.hidden || typeof window.setTimeout !== "function") return;
+    _dropdownRefreshTimer = window.setTimeout(() => {
+        _dropdownRefreshTimer = null;
+        if (window._dashboardFrozen || document.hidden) return;
+        AR.refreshDropdowns();
+        scheduleDropdownRefresh();
+    }, delay);
+}
+
+function resetDropdownRefreshTimer() {
+    scheduleDropdownRefresh();
+}
+
+// Called by the Qt lifecycle bridge when QWebEnginePage enters/leaves Frozen.
+// Keeping this explicit avoids relying solely on document.hidden, which is not
+// guaranteed to change for every tray/minimize path.
+window.setDashboardFrozen = function (frozen) {
+    window._dashboardFrozen = !!frozen;
+    if (window._dashboardFrozen) stopDropdownRefreshTimer();
+    else scheduleDropdownRefresh();
+};
 
 // Follow-up work to run once a select's options have actually landed in the DOM.
 // Registered per id so a *deferred* fill still triggers what its caller expected
@@ -1215,6 +1316,27 @@ function syncMoveUI() {
     btn.classList.toggle("is-active", moveModeActive);
 }
 
+// Frozen WebEngine pages can resume without replaying the initial script.  A
+// cheap redraw keeps the static customization preview visible after restoring
+// the dashboard from the tray or taskbar.
+function redrawPreviewAfterResume() {
+    const redraw = () => drawPreview();
+    if (typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(redraw);
+    } else {
+        redraw();
+    }
+}
+
+if (document.addEventListener) {
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) redrawPreviewAfterResume();
+    });
+}
+if (window.addEventListener) {
+    window.addEventListener("pageshow", redrawPreviewAfterResume);
+}
+
 function isEditableTarget(target) {
     return Boolean(target?.closest?.(EDITABLE_SELECTOR));
 }
@@ -1245,6 +1367,17 @@ document.addEventListener("DOMContentLoaded", function () {
     // Default program option until/unless backend sends a list
     fillSelect("program-select", [{ value: "all", label: "All (system audio)" }]);
 
+    // A native <select> popup is opened before its change event fires. Refresh
+    // at that boundary so newly connected monitors/programs are available in
+    // the popup without rebuilding it continuously while it is open.
+    ["monitor-select", "program-select"].forEach(id => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        select.addEventListener("mousedown", () => AR.refreshDropdown(id));
+        select.addEventListener("focus", () => AR.refreshDropdown(id));
+    });
+    scheduleDropdownRefresh();
+
     // Wire dual-range inputs
     ["freq-low", "freq-high"].forEach(id =>
         document.getElementById(id).addEventListener("input", AR.setFreqRange));
@@ -1252,7 +1385,13 @@ document.addEventListener("DOMContentLoaded", function () {
     document.addEventListener("keyup", releaseHotkey, true);
     window.addEventListener("blur", clearPressedHotkeys);
     document.addEventListener("visibilitychange", () => {
-        if (document.hidden) clearPressedHotkeys();
+        if (document.hidden) {
+            clearPressedHotkeys();
+            stopDropdownRefreshTimer();
+        } else {
+            AR.refreshDropdowns();
+            scheduleDropdownRefresh();
+        }
     });
 
     // Initial paint of values/fills/preview

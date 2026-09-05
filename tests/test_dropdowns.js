@@ -189,6 +189,22 @@ W.onProgramsChanged(JSON.stringify(["cs2.exe"]));
 check("falls back to All (system audio)", program.value === "all", program.value);
 check("not a blank selection", program.selectedIndex === 0, String(program.selectedIndex));
 
+// On-demand monitor/program refresh must be suppressed while the page is frozen.
+section("on-demand hardware refresh");
+calls.splice(0);
+W.AR.refreshDropdown("monitor-select");
+check("opening monitor requests a fresh screen list",
+    calls.some(c => c[0] === "refresh_monitors"), JSON.stringify(calls));
+calls.splice(0);
+W.AR.refreshDropdown("program-select");
+check("opening program requests a fresh process list",
+    calls.some(c => c[0] === "refresh_programs"), JSON.stringify(calls));
+calls.splice(0);
+W.setDashboardFrozen(true);
+W.AR.refreshDropdowns();
+check("frozen dashboard does not refresh either list", calls.length === 0, JSON.stringify(calls));
+W.setDashboardFrozen(false);
+
 // ── 7. Mono select keeps "" as a real value ────────────────────────────
 section("mono output select");
 W.onMonoStateChanged(JSON.stringify({ devices: ["Headphones", "CABLE Input"], default: "Headphones",

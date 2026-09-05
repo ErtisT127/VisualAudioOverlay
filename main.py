@@ -14,7 +14,6 @@
 # nuitka-project: --include-module=audio_capture
 # nuitka-project: --include-module=app_logging
 # nuitka-project: --include-module=direction
-# nuitka-project: --include-module=overlay
 # nuitka-project: --include-module=mono_output
 # nuitka-project: --include-module=process_loopback
 
@@ -70,28 +69,121 @@ _IS_PACKAGED_LAUNCH = (
     or bool(getattr(sys, "frozen", False))
     or not _exe_name.startswith(("python", "pypy"))
 )
+
+
+def _initial_windows_scale() -> float:
+    """Read the system scale before Qt creates its first screen/window."""
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_dpi = getattr(user32, "GetDpiForSystem", None)
+        if get_dpi is not None:
+            get_dpi.argtypes = []
+            get_dpi.restype = wintypes.UINT
+            dpi = int(get_dpi())
+            if dpi > 0:
+                return dpi / 96.0
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return 1.0
+
+
+def _enable_per_monitor_dpi_awareness():
+    """Declare the process DPI mode before Qt creates any windows.
+
+    Qt 6 normally enables high-DPI scaling itself, but a packaged process can
+    inherit a legacy/system DPI context from its launcher.  In that case
+    Windows bitmap-scales the WebEngine backing surface when the dashboard is
+    shown on a non-100% display, producing blurred text and stale geometry.
+    The call is intentionally best-effort: Qt remains the fallback on older
+    Windows builds and on non-Windows test runners.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        setter = getattr(user32, "SetProcessDpiAwarenessContext", None)
+        if setter is not None:
+            setter.argtypes = [ctypes.c_void_p]
+            setter.restype = wintypes.BOOL
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is (HANDLE)-4.
+            if setter(ctypes.c_void_p(-4)):
+                return
+        # Windows 10 versions without the context API still support the
+        # process-wide shcore API.  Failure here is harmless; Qt will choose
+        # its normal platform DPI policy.
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        setter = getattr(shcore, "SetProcessDpiAwareness", None)
+        if setter is not None:
+            setter.argtypes = [ctypes.c_int]
+            setter.restype = ctypes.c_long
+            setter(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except (AttributeError, OSError, TypeError, ValueError):
+        # This must never prevent the dashboard from starting.
+        return
+
+
+_enable_per_monitor_dpi_awareness()
+# Qt reads this policy while initializing its platform plugin; setting the
+# environment value as well as the API below covers packaged launches where
+# the plugin may be initialized before the Python-side QApplication call.
+os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+
 if _IS_PACKAGED_LAUNCH:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-logging")
 
+
+def _append_webengine_scale_flag(scale: float):
+    """Keep Chromium's device scale aligned with Qt's initial screen DPR.
+
+    QtWebEngine can otherwise derive a different fractional scale from the
+    Windows compositor (observed as Qt=1.5, Chromium=1.8).  That mismatch makes
+    Chromium render a backing surface at the wrong size and lets Windows
+    resample the whole dashboard.  Respect an explicit caller override, since
+    it is useful for diagnostics and kiosk deployments.
+    """
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not math.isfinite(scale) or scale <= 0:
+        return
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+    if "--force-device-scale-factor=" in flags:
+        return
+    formatted = f"{scale:.4f}".rstrip("0").rstrip(".")
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+        f"{flags} --force-device-scale-factor={formatted}".strip()
+    )
+# Chromium reads this during QtWebEngine startup, before QApplication has a
+# primary QScreen that Python can inspect.  Configure it at import time so the
+# first renderer surface uses the same scale as Qt instead of being resampled.
+_append_webengine_scale_flag(_initial_windows_scale())
+
 from PyQt6.QtCore import (
     QAbstractNativeEventFilter,
+    QEvent,
     QObject,
     QThread,
     QTimer,
     QtMsgType,
+    Qt,
     QUrl,
     pyqtSignal,
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtGui import QAction, QIcon, QGuiApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QSystemTrayIcon,
 )
 
@@ -103,7 +195,7 @@ from app_logging import (
     get_logger,
 )
 from audio_capture import AudioCaptureThread
-from overlay import OverlayRadar
+from native_overlay import NativeOverlay
 
 # RESOURCE_DIR contains bundled, read-only assets. Nuitka resolves __file__ inside
 # the deployed bundle; user data belongs next to the executable when packaged.
@@ -179,7 +271,7 @@ TRAY_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
 # ── Version + project links ─────────────────────────────────────────────────
 # APP_VERSION must match the GitHub release tag (without the leading "v") for the
 # update check to compare correctly. Bump this for every release you tag.
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay"
 # Latest-release JSON (no auth needed; 60 req/hr per IP is plenty for one check
 # per launch). Used by the in-app update check to reach users who already have
@@ -744,6 +836,7 @@ class Bridge(QObject):
     deviceChanged = pyqtSignal(str)  # detected device name
     profilesChanged = pyqtSignal(str)  # full profiles dict as JSON
     monitorsChanged = pyqtSignal(str)  # list of monitors as JSON
+    selectedMonitorChanged = pyqtSignal(int)
     presetsChanged = pyqtSignal(str)  # permanent builtin catalog as JSON
     programsChanged = pyqtSignal(str)  # running audio programs as JSON
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
@@ -856,7 +949,7 @@ class Bridge(QObject):
     @pyqtSlot(int)
     def set_monitor(self, idx: int):
         logger.info("monitor changed index=%s", idx)
-        self._app.selected_monitor = idx
+        self._app.set_monitor(idx)
 
     @pyqtSlot(str)
     def set_program(self, value: str):
@@ -869,6 +962,11 @@ class Bridge(QObject):
         the Program dropdown, so the list is live (a program only appears once it
         is actually playing audio)."""
         self._app.emit_programs()
+
+    @pyqtSlot()
+    def refresh_monitors(self):
+        """Refresh the monitor list when its dropdown is opened."""
+        self._app.emit_monitors()
 
     # ── Mono output (single-sided listeners) ──────────────────────────
     @pyqtSlot(bool)
@@ -985,17 +1083,8 @@ class Bridge(QObject):
         Python responds by emitting all initial state signals.
         """
         # Monitors
-        screens = QApplication.screens()
-        monitors = [
-            {
-                "idx": i,
-                "name": s.name(),
-                "resolution": f"{s.geometry().width()}×{s.geometry().height()}",
-            }
-            for i, s in enumerate(screens)
-        ]
-        self.monitorsChanged.emit(json.dumps(monitors))
-
+        self._app.emit_monitors()
+        self.selectedMonitorChanged.emit(int(self._app.selected_monitor))
         # Preset/profile selection saved from the last session. Emitted BEFORE the
         # two lists that build the dropdown, so JS knows what to re-select as soon
         # as the matching option appears (JS also re-checks on every rebuild, so
@@ -1042,13 +1131,19 @@ class Bridge(QObject):
 
 
 class AudioRadarApp(QMainWindow):
+    DEFAULT_WINDOW_WIDTH = 1100
+    DEFAULT_WINDOW_HEIGHT = 720
+    MIN_WINDOW_WIDTH = DEFAULT_WINDOW_WIDTH
+    MIN_WINDOW_HEIGHT = DEFAULT_WINDOW_HEIGHT
+
     def __init__(self, single_instance_server=None):
         super().__init__()
         logger.info("application window initialization started")
         self.setWindowTitle("Visual Audio Overlay")
         if os.path.exists(APP_ICON):
             self.setWindowIcon(QIcon(APP_ICON))
-        self.resize(1100, 720)
+        self.setMinimumSize(self.MIN_WINDOW_WIDTH, self.MIN_WINDOW_HEIGHT)
+        self.resize(self.DEFAULT_WINDOW_WIDTH, self.DEFAULT_WINDOW_HEIGHT)
         self._closing_for_exit = False
         self._exit_finalized = False
         self._exit_finalize_pending = False
@@ -1060,6 +1155,18 @@ class AudioRadarApp(QMainWindow):
         self._audio_consume_timer = QTimer(self)
         self._audio_consume_timer.setInterval(15)
         self._audio_consume_timer.timeout.connect(self._consume_latest_audio)
+        # Chromium keeps its renderer/GPU context alive while a WebEngine view is
+        # merely hidden.  Freeze the page after a short debounce when the
+        # dashboard is minimized or sent to the tray, and reactivate it when the
+        # window returns.  The debounce avoids repeatedly toggling lifecycle state
+        # when a user briefly minimizes/restores the window.
+        self._dashboard_frozen = False
+        self._dashboard_freeze_timer = QTimer(self)
+        self._dashboard_freeze_timer.setSingleShot(True)
+        self._dashboard_freeze_timer.setInterval(600)
+        self._dashboard_freeze_timer.timeout.connect(
+            self._freeze_dashboard_if_hidden
+        )
         self._program_list_thread = None
         self._mono_device_thread = None
         self._mono_refresh_pending = False
@@ -1077,6 +1184,7 @@ class AudioRadarApp(QMainWindow):
 
         self.invert_direction = False
         self.selected_monitor = 0
+        self._selected_monitor_name = None
         self.selected_program = None  # None = whole-system audio; else a program name
         fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(
             SETTINGS_FILE
@@ -1174,8 +1282,19 @@ class AudioRadarApp(QMainWindow):
         self.mono_enabled = bool(self.settings.get("mono_enabled", False))
         self.mono_device = self.settings.get("mono_device") or None
 
-        # Overlay (PyQt6 transparent window - unchanged)
-        self.overlay = OverlayRadar()
+        # Native Direct2D/DirectComposition overlay.  There is intentionally no
+        # QWidget fallback: a failed native renderer must be visible and must not
+        # silently reintroduce the compositor path this backend replaces.
+        try:
+            self.overlay = NativeOverlay()
+        except Exception as exc:
+            logger.exception("native overlay initialization failed")
+            QMessageBox.critical(
+                self,
+                "Visual Audio Overlay",
+                f"Unable to initialize the native overlay renderer.\n\n{exc}",
+            )
+            raise RuntimeError("native overlay initialization failed") from exc
 
         # Overlay appearance (accent colour + stroke). Persisted in settings.json so
         # the look survives restarts; applied to the overlay now and pushed to the
@@ -1195,8 +1314,32 @@ class AudioRadarApp(QMainWindow):
         self.overlay.positionChanged.connect(self.on_overlay_position_changed)
         self.overlay.positionPreview.connect(self.on_overlay_position_preview)
 
+        # Keep the monitor model and the persisted overlay position valid when
+        # Windows hot-plugs a display or changes projection mode.  QScreen
+        # geometry signals are preferred over polling so a frozen dashboard
+        # does not hide topology changes from the native overlay.
+        self._screen_watch_ids = set()
+        self._screen_change_timer = QTimer(self)
+        self._screen_change_timer.setSingleShot(True)
+        self._screen_change_timer.setInterval(120)
+        self._screen_change_timer.timeout.connect(self._reconcile_screen_layout)
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.screenAdded.connect(self._on_screen_added)
+                app.screenRemoved.connect(self._on_screen_removed)
+                app.primaryScreenChanged.connect(self._on_primary_screen_changed)
+            except (AttributeError, TypeError):
+                logger.debug("screen topology signals unavailable", exc_info=True)
+            for screen in app.screens():
+                self._watch_screen_geometry(screen)
+
         # WebEngine view
         self.view = QWebEngineView()
+        # Keep Chromium's CSS viewport at its native zoom.  A stale page zoom
+        # survives a renderer restart and is then bitmap-scaled by Windows,
+        # which presents as a blurry dashboard with shifted grid edges.
+        self.view.setZoomFactor(1.0)
 
         # WebChannel - registers `bridge` as `window.bridge` in JS
         self.channel = QWebChannel()
@@ -1204,6 +1347,8 @@ class AudioRadarApp(QMainWindow):
         self.view.page().setWebChannel(self.channel)
 
         self.setCentralWidget(self.view)
+        self._dashboard_window_handle = None
+        self._connect_dashboard_screen_signal()
 
         configured_hotkey = self.settings.get("hotkey", "F8")
         self.hotkey_controller = HotkeyController(self, configured_hotkey)
@@ -1213,6 +1358,7 @@ class AudioRadarApp(QMainWindow):
         QTimer.singleShot(0, self.hotkey_controller.ensure_registered)
 
         # Load the dashboard HTML
+        self.view.loadFinished.connect(self._redraw_dashboard_preview)
         self.view.setUrl(QUrl.fromLocalFile(DASHBOARD_FILE))
 
         # Check GitHub for a newer release in the background. If found, the bridge
@@ -1252,9 +1398,293 @@ class AudioRadarApp(QMainWindow):
         self.tray_icon.show()
 
     def _restore_from_tray(self):
+        self._set_dashboard_frozen(False)
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def _freeze_dashboard_if_hidden(self):
+        """Freeze WebEngine only if the dashboard stayed hidden/minimized."""
+        if self._closing_for_exit or self.isVisible() and not self.isMinimized():
+            return
+        self._set_dashboard_frozen(True)
+
+    def _schedule_dashboard_freeze(self):
+        """Debounce a transition to the hidden/minimized dashboard state."""
+        if self._closing_for_exit:
+            return
+        self._dashboard_freeze_timer.start()
+
+    def _set_dashboard_frozen(self, frozen: bool):
+        """Set the WebEngine page lifecycle state without affecting app state.
+
+        The dashboard's source of truth remains on ``AudioRadarApp``/``Bridge``;
+        after thawing we replay the same initial-state signals used on first page
+        load so controls cannot remain stale after being paused.
+        """
+        frozen = bool(frozen)
+        self._dashboard_freeze_timer.stop()
+        if frozen == self._dashboard_frozen:
+            return
+
+        view = getattr(self, "view", None)
+        page = view.page() if view is not None else None
+        lifecycle = getattr(QWebEnginePage, "LifecycleState", None)
+        target = getattr(lifecycle, "Frozen" if frozen else "Active", None)
+        setter = getattr(page, "setLifecycleState", None)
+        if target is None or setter is None:
+            logger.debug("WebEngine lifecycle state is unavailable; frozen=%s", frozen)
+            return
+        try:
+            setter(target)
+        except Exception:
+            # Freezing is an optional resource optimization.  Never let an
+            # unsupported QtWebEngine build break dashboard visibility or exit.
+            logger.exception("failed to set WebEngine lifecycle state frozen=%s", frozen)
+            return
+
+        self._dashboard_frozen = frozen
+        logger.debug("dashboard WebEngine lifecycle=%s", "Frozen" if frozen else "Active")
+        # Keep the page-side refresh scheduler in sync with the native lifecycle
+        # state.  ``document.hidden`` is not guaranteed to change for tray hides,
+        # so this explicit hook is the source of truth for dropdown polling.
+        runner = getattr(page, "runJavaScript", None)
+        if runner is not None:
+            try:
+                runner(
+                    "if (window.setDashboardFrozen) "
+                    f"window.setDashboardFrozen({'true' if frozen else 'false'});"
+                )
+            except Exception:
+                logger.debug("dashboard refresh scheduler sync skipped", exc_info=True)
+        if not frozen:
+            # Signals are no-ops until the page has established its WebChannel;
+            # request_initial_data() remains the canonical synchronization path.
+            bridge = getattr(self, "bridge", None)
+            if bridge is not None:
+                QTimer.singleShot(0, bridge.request_initial_data)
+            # A frozen Chromium page can resume with a discarded 2D canvas
+            # backing surface even though the DOM and WebChannel state survive.
+            # Redraw after activation so the customization preview cannot stay
+            # blank until the next user interaction.
+            redraw = getattr(self, "_redraw_dashboard_preview", None)
+            if redraw is not None:
+                QTimer.singleShot(40, redraw)
+            refresh = getattr(self, "_refresh_dashboard_viewport", None)
+            if refresh is not None:
+                QTimer.singleShot(100, refresh)
+
+    def _redraw_dashboard_preview(self, ok=True):
+        """Repaint the dashboard canvas after load or WebEngine thaw."""
+        if ok is False or self._closing_for_exit:
+            return
+        view = getattr(self, "view", None)
+        page = view.page() if view is not None else None
+        runner = getattr(page, "runJavaScript", None)
+        if runner is None:
+            return
+        try:
+            frozen = bool(getattr(self, "_dashboard_frozen", False))
+            runner(
+                "if (window.setDashboardFrozen) "
+                f"window.setDashboardFrozen({'true' if frozen else 'false'});"
+            )
+            if frozen:
+                return
+            runner(
+                "if (typeof drawPreview === 'function') "
+                "window.requestAnimationFrame(drawPreview);"
+            )
+            self._log_dashboard_metrics(page)
+        except Exception:
+            logger.debug("dashboard preview redraw skipped", exc_info=True)
+
+    def _log_dashboard_metrics(self, page=None):
+        """Record the browser's effective scale/layout after a page redraw."""
+        if page is None:
+            view = getattr(self, "view", None)
+            page = view.page() if view is not None else None
+        runner = getattr(page, "runJavaScript", None)
+        if runner is None:
+            return
+        script = (
+            "(() => { const a=document.getElementById('app'); "
+            "const c=document.getElementById('preview-canvas'); "
+            "const r=a?a.getBoundingClientRect():null; "
+            "const cr=c?c.getBoundingClientRect():null; "
+            "return JSON.stringify({dpr:window.devicePixelRatio,"
+            "zoom:visualViewport&&visualViewport.scale,"
+            "inner:[innerWidth,innerHeight],"
+            "app:r&&[r.x,r.y,r.width,r.height],"
+            "canvas:cr&&[cr.x,cr.y,cr.width,cr.height],"
+            "fonts:document.fonts&&document.fonts.status}); })()"
+        )
+        try:
+            def report(value):
+                logger.info("dashboard metrics=%s", value)
+                try:
+                    metrics = json.loads(value)
+                    browser_dpr = float(metrics.get("dpr", 0.0))
+                    view = getattr(self, "view", None)
+                    qt_dpr = float(view.devicePixelRatioF()) if view is not None else 0.0
+                    if qt_dpr > 0 and abs(browser_dpr - qt_dpr) > 0.05:
+                        logger.error(
+                            "dashboard DPI mismatch: qt_dpr=%.3f browser_dpr=%.3f metrics=%s",
+                            qt_dpr,
+                            browser_dpr,
+                            value,
+                        )
+                except (TypeError, ValueError, AttributeError, RuntimeError):
+                    return
+
+            runner(script, report)
+        except (TypeError, RuntimeError):
+            # Test doubles and older bindings may expose only the one-argument
+            # overload; diagnostics must never affect rendering.
+            return
+
+    def _on_dashboard_screen_changed(self, _screen=None):
+        """Re-synchronize Chromium after the top-level window crosses displays."""
+        self._schedule_screen_reconcile()
+        if self._closing_for_exit or getattr(self, "_dashboard_frozen", False):
+            return
+        QTimer.singleShot(120, self._refresh_dashboard_viewport)
+
+    def _refresh_dashboard_viewport(self):
+        """Force a layout/paint pass after a DPI or compositor transition.
+
+        WebEngine keeps the DOM alive across a monitor switch, but its viewport
+        can briefly retain the old device scale.  A resize event is not
+        guaranteed when only the screen DPI changes, so explicitly request a
+        browser resize/reflow and redraw the preview once the new surface is
+        active.  No CSS zoom is applied here.
+        """
+        if self._closing_for_exit or getattr(self, "_dashboard_frozen", False):
+            return
+        view = getattr(self, "view", None)
+        if view is None:
+            return
+        try:
+            # Re-assert the neutral page zoom after Chromium recreates its
+            # renderer for a new monitor.  This forces a fresh layout scale
+            # without introducing a CSS transform or changing any controls.
+            view.setZoomFactor(1.0)
+            view.updateGeometry()
+            view.update()
+            window_handle = view.windowHandle()
+            screen = window_handle.screen() if window_handle is not None else None
+            if screen is None:
+                screen = self.screen()
+            logger.debug(
+                "dashboard Qt viewport: view=%sx%s dpr=%.3f zoom=%.3f screen=%s screen_dpr=%.3f",
+                view.width(),
+                view.height(),
+                float(view.devicePixelRatioF()),
+                float(view.zoomFactor()),
+                screen.name() if screen is not None else None,
+                float(screen.devicePixelRatio()) if screen is not None else 0.0,
+            )
+            page = view.page()
+            runner = getattr(page, "runJavaScript", None)
+            if runner is not None:
+                runner(
+                    "void document.documentElement.offsetWidth;"
+                    "window.dispatchEvent(new Event('resize'));"
+                    "if (typeof redrawPreview === 'function') "
+                    "window.requestAnimationFrame(drawPreview);"
+                )
+                # The local Google Sans font can finish after loadFinished.
+                # Redraw once it is ready so the final glyph metrics, grid
+                # widths and canvas position are calculated from the same font
+                # used for the visible page instead of the temporary fallback.
+                runner(
+                    "if (document.fonts && document.fonts.ready) "
+                    "document.fonts.ready.then(() => {"
+                    "window.dispatchEvent(new Event('resize'));"
+                    "if (typeof drawPreview === 'function') drawPreview();"
+                    "});"
+                )
+                if _debug_logging:
+                    runner(
+                    "JSON.stringify((() => {"
+                    "const c=document.getElementById('preview-canvas');"
+                    "const a=document.getElementById('app');"
+                    "const cr=c?.getBoundingClientRect();"
+                    "const ar=a?.getBoundingClientRect();"
+                    "const cs=a?getComputedStyle(a):null;"
+                    "return {dpr:window.devicePixelRatio,"
+                    "visualScale:window.visualViewport?.scale||1,"
+                    "innerWidth:window.innerWidth,innerHeight:window.innerHeight,"
+                    "clientWidth:document.documentElement.clientWidth,"
+                    "clientHeight:document.documentElement.clientHeight,"
+                    "appRect:ar?{x:ar.x,y:ar.y,w:ar.width,h:ar.height}:null,"
+                    "canvasRect:cr?{x:cr.x,y:cr.y,w:cr.width,h:cr.height}:null,"
+                    "canvasBitmap:c?{w:c.width,h:c.height}:null,"
+                    "appFont:cs?cs.fontFamily:null};})())",
+                        lambda value: logger.debug("dashboard viewport=%s", value),
+                    )
+        except Exception:
+            logger.debug("dashboard viewport refresh skipped", exc_info=True)
+
+    def _connect_dashboard_screen_signal(self):
+        """Attach to the native window once Qt has created its QWindow handle."""
+        handle = self.windowHandle()
+        if handle is None or handle is self._dashboard_window_handle:
+            return
+        try:
+            handle.screenChanged.connect(self._on_dashboard_screen_changed)
+            self._dashboard_window_handle = handle
+        except (AttributeError, TypeError):
+            logger.debug("dashboard screenChanged signal unavailable", exc_info=True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._connect_dashboard_screen_signal()
+        # The first WebEngine surface can be allocated before the top-level
+        # window has acquired its final screen/DPI.  Rebind it once after the
+        # native window is visible; this is a no-op while the page is frozen.
+        QTimer.singleShot(150, self._refresh_dashboard_viewport)
+        try:
+            screen = self.screen()
+            logger.info(
+                "dashboard display ready: qt_size=%sx%s qt_dpr=%.3f screen=%s screen_dpr=%.3f",
+                self.width(),
+                self.height(),
+                float(self.devicePixelRatioF()),
+                screen.name() if screen else None,
+                float(screen.devicePixelRatio()) if screen else 0.0,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            logger.debug("dashboard display metrics unavailable", exc_info=True)
+        if _debug_logging:
+            try:
+                screen = self.screen()
+                logger.debug(
+                    "dashboard Qt geometry=%s size=%s dpr=%s screen=%s screen_geo=%s",
+                    self.geometry().getRect(),
+                    (self.width(), self.height()),
+                    self.devicePixelRatioF(),
+                    screen.name() if screen else None,
+                    screen.geometry().getRect() if screen else None,
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                logger.debug("dashboard Qt metrics unavailable", exc_info=True)
+
+    def changeEvent(self, event):
+        """Freeze WebEngine after minimize and thaw it on restore."""
+        super().changeEvent(event)
+        if event.type() != QEvent.Type.WindowStateChange:
+            return
+        if self.isMinimized():
+            self._schedule_dashboard_freeze()
+        elif self.isVisible():
+            self._set_dashboard_frozen(False)
+
+    def hideEvent(self, event):
+        """Also cover explicit tray/close-to-tray hides (no state change event)."""
+        super().hideEvent(event)
+        if not self._closing_for_exit and hasattr(self, "_dashboard_freeze_timer"):
+            self._schedule_dashboard_freeze()
 
     def _on_single_instance_connection(self):
         while self._single_instance_server.hasPendingConnections():
@@ -1281,10 +1711,10 @@ class AudioRadarApp(QMainWindow):
         self.close()
 
     # ── Audio Callbacks ───────────────────────────────────────────────
-    def on_audio_data(self, angle: float, intensity: float):
+    def on_audio_data(self, angle: float, intensity: float, generation=None):
         if self.invert_direction:
             angle = -angle
-        self.overlay.update_audio_data(angle, intensity)
+        self.overlay.update_audio_data(angle, intensity, generation)
 
     def on_device_info(self, name: str, channels: int):
         label = f"{name}  ({channels}ch)"
@@ -1317,7 +1747,7 @@ class AudioRadarApp(QMainWindow):
             return
         sample = thread.take_latest_audio()
         if sample is not None:
-            self.on_audio_data(*sample)
+            self.on_audio_data(*sample, generation=generation)
 
     def _stop_audio_consumption(self):
         self._audio_consume_timer.stop()
@@ -1373,6 +1803,8 @@ class AudioRadarApp(QMainWindow):
         thread._capture_generation = generation
         self.audio_thread = thread
         self._active_capture_generation = generation
+        if hasattr(self, "overlay"):
+            self.overlay.set_capture_generation(generation)
         thread.device_info_signal.connect(self._on_capture_device)
         thread.status_signal.connect(self._on_capture_status)
         thread.error_signal.connect(self._on_capture_error)
@@ -1381,8 +1813,11 @@ class AudioRadarApp(QMainWindow):
         logger.debug("new capture thread generation=%s", generation)
 
     def on_overlay_position_changed(self, x: int, y: int):
+        x, y = self._clamp_overlay_position(x, y)
+        if (x, y) != (int(self.overlay.pos().x()), int(self.overlay.pos().y())):
+            self.overlay.move(x, y)
         logger.info("overlay position persisted x=%s y=%s", x, y)
-        self.settings["overlay_position"] = {"x": int(x), "y": int(y)}
+        self.settings["overlay_position"] = {"x": x, "y": y}
         self._save_settings()
         self.emit_overlay_position()
 
@@ -1426,7 +1861,48 @@ class AudioRadarApp(QMainWindow):
             logger.exception("Program enumeration failed")
             return []
 
+    def emit_monitors(self):
+        """Emit the current screen list for the dashboard monitor selector."""
+        if getattr(self, "_dashboard_frozen", False):
+            logger.debug("monitor list refresh skipped: dashboard frozen")
+            return
+        screens = QApplication.screens()
+        if screens and not self._selected_monitor_name:
+            idx = max(0, min(int(self.selected_monitor), len(screens) - 1))
+            self.selected_monitor = idx
+            self._selected_monitor_name = screens[idx].name()
+        monitors = [
+            {
+                "idx": i,
+                "name": s.name(),
+                "resolution": f"{s.geometry().width()}x{s.geometry().height()}",
+            }
+            for i, s in enumerate(screens)
+        ]
+        self.bridge.monitorsChanged.emit(json.dumps(monitors))
+
+    def set_monitor(self, idx):
+        """Select a monitor and move a visible overlay to that monitor."""
+        screens = QApplication.screens()
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not screens or not 0 <= idx < len(screens):
+            logger.warning("invalid monitor index ignored index=%r", idx)
+            return
+        self.selected_monitor = idx
+        self._selected_monitor_name = screens[idx].name()
+        if self.overlay.isVisible():
+            x, y = self._selected_monitor_center_position()
+            self.overlay.move(x, y)
+            self.on_overlay_position_changed(x, y)
+        self.bridge.selectedMonitorChanged.emit(idx)
+
     def emit_programs(self):
+        if getattr(self, "_dashboard_frozen", False):
+            logger.debug("program list refresh skipped: dashboard frozen")
+            return
         if self._program_list_thread is not None:
             # Keep ownership until its queued finished callback releases it.
             # isRunning() can already be false before that callback is delivered.
@@ -1908,6 +2384,10 @@ class AudioRadarApp(QMainWindow):
         self._set_operation_state("starting")
         self._capture_terminal_error = None
         self.radar_active = False
+        # Radar runtime must always be input-transparent.  The dashboard can
+        # leave drag mode enabled while positioning the overlay; do not carry
+        # that interactive state into the game session.
+        self.overlay.set_drag_enabled(False)
         self.overlay.show()
         if place_overlay:
             self._place_overlay_for_start()
@@ -1972,19 +2452,130 @@ class AudioRadarApp(QMainWindow):
 
     def _selected_monitor_center_position(self):
         screens = QApplication.screens()
-        idx = self.selected_monitor if self.selected_monitor < len(screens) else 0
-        geo = screens[idx].geometry()
+        if not screens:
+            return 0, 0
+        idx = self.selected_monitor if 0 <= self.selected_monitor < len(screens) else 0
+        geo = screens[idx].availableGeometry()
         return (
             geo.x() + (geo.width() - self.overlay.width()) // 2,
             geo.y() + (geo.height() - self.overlay.height()) // 2,
         )
 
+    def _clamp_overlay_position(self, x, y, screen=None):
+        """Clamp the full overlay rectangle inside the active work area."""
+        try:
+            x, y = int(x), int(y)
+        except (TypeError, ValueError, OverflowError):
+            return self._selected_monitor_center_position()
+        screens = QApplication.screens()
+        if not screens:
+            return x, y
+        if screen is None:
+            cx = x + self.overlay.width() / 2
+            cy = y + self.overlay.height() / 2
+            screen = next(
+                (s for s in screens if s.geometry().contains(round(cx), round(cy))),
+                None,
+            )
+        if screen is None:
+            screen = (
+                screens[self.selected_monitor]
+                if 0 <= self.selected_monitor < len(screens)
+                else screens[0]
+            )
+        geo = screen.availableGeometry()
+        max_x = max(geo.x(), geo.right() - self.overlay.width() + 1)
+        max_y = max(geo.y(), geo.bottom() - self.overlay.height() + 1)
+        return max(geo.x(), min(x, max_x)), max(geo.y(), min(y, max_y))
+
+    def _watch_screen_geometry(self, screen):
+        key = id(screen)
+        if key in self._screen_watch_ids:
+            return
+        self._screen_watch_ids.add(key)
+        for signal_name in (
+            "geometryChanged",
+            "availableGeometryChanged",
+            "logicalDotsPerInchChanged",
+            "nameChanged",
+        ):
+            signal = getattr(screen, signal_name, None)
+            if signal is not None:
+                try:
+                    signal.connect(self._on_screen_geometry_changed)
+                except (AttributeError, TypeError):
+                    logger.debug("unable to watch QScreen.%s", signal_name, exc_info=True)
+
+    def _on_screen_added(self, screen):
+        self._watch_screen_geometry(screen)
+        self._schedule_screen_reconcile()
+
+    def _on_primary_screen_changed(self, screen):
+        self._watch_screen_geometry(screen)
+        self._schedule_screen_reconcile()
+
+    def _on_screen_removed(self, screen):
+        self._screen_watch_ids.discard(id(screen))
+        self._schedule_screen_reconcile()
+
+    def _on_screen_geometry_changed(self, *_args):
+        self._schedule_screen_reconcile()
+
+    def _schedule_screen_reconcile(self):
+        if not self._closing_for_exit:
+            self._screen_change_timer.start()
+
+    def _reconcile_screen_layout(self):
+        if self._closing_for_exit:
+            return
+        screens = QApplication.screens()
+        if not screens:
+            return
+        if self._selected_monitor_name:
+            matching = next(
+                (i for i, screen in enumerate(screens)
+                 if screen.name() == self._selected_monitor_name),
+                None,
+            )
+            if matching is not None:
+                self.selected_monitor = matching
+        self.selected_monitor = max(0, min(int(self.selected_monitor), len(screens) - 1))
+        self._selected_monitor_name = screens[self.selected_monitor].name()
+        current = self.overlay.pos()
+        x, y = self._clamp_overlay_position(current.x(), current.y())
+        # Re-submit even when the logical coordinates did not change: a DPI or
+        # projection switch can change the physical mapping and swap-chain size
+        # without moving the logical overlay.
+        self.overlay.move(x, y)
+        if (x, y) != (current.x(), current.y()):
+            self.on_overlay_position_changed(x, y)
+        bridge = getattr(self, "bridge", None)
+        if bridge is not None and not getattr(self, "_dashboard_frozen", False):
+            monitors = [
+                {"idx": i, "name": s.name(),
+                 "resolution": f"{s.geometry().width()}x{s.geometry().height()}"}
+                for i, s in enumerate(screens)
+            ]
+            bridge.monitorsChanged.emit(json.dumps(monitors))
+            bridge.selectedMonitorChanged.emit(int(self.selected_monitor))
+        # Chromium may discard a canvas backing surface during a display-mode
+        # switch even while the dashboard remains visible.  A deferred redraw
+        # restores the customization preview after the new compositor device
+        # is available, without introducing a persistent timer.
+        redraw = getattr(self, "_redraw_dashboard_preview", None)
+        if redraw is not None and not getattr(self, "_dashboard_frozen", False):
+            QTimer.singleShot(80, redraw)
+            QTimer.singleShot(120, self._refresh_dashboard_viewport)
+
     def _saved_overlay_position_is_visible(self, pos):
         if not isinstance(pos, dict) or "x" not in pos or "y" not in pos:
             return False
 
-        x = int(pos["x"])
-        y = int(pos["y"])
+        try:
+            x = int(pos["x"])
+            y = int(pos["y"])
+        except (TypeError, ValueError, OverflowError):
+            return False
         width = self.overlay.width()
         height = self.overlay.height()
 
@@ -1998,8 +2589,23 @@ class AudioRadarApp(QMainWindow):
 
     def _place_overlay_for_start(self):
         pos = self.settings.get("overlay_position")
-        if self._saved_overlay_position_is_visible(pos):
-            self.overlay.move(int(pos["x"]), int(pos["y"]))
+        screens = QApplication.screens()
+        selected = (
+            screens[self.selected_monitor]
+            if screens and 0 <= self.selected_monitor < len(screens)
+            else None
+        )
+        saved_on_selected = False
+        if selected is not None and isinstance(pos, dict):
+            try:
+                px, py = int(pos["x"]), int(pos["y"])
+                center = (px + self.overlay.width() // 2, py + self.overlay.height() // 2)
+                saved_on_selected = selected.geometry().contains(*center)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                saved_on_selected = False
+        if saved_on_selected and self._saved_overlay_position_is_visible(pos):
+            x, y = self._clamp_overlay_position(pos["x"], pos["y"], selected)
+            self.overlay.move(x, y)
         else:
             x, y = self._selected_monitor_center_position()
             self.overlay.move(x, y)
@@ -2029,8 +2635,9 @@ class AudioRadarApp(QMainWindow):
             if not self.radar_active:
                 self.overlay.set_drag_enabled(True)
 
-        self.overlay.move(int(x), int(y))
-        self.on_overlay_position_changed(int(x), int(y))
+        x, y = self._clamp_overlay_position(x, y)
+        self.overlay.move(x, y)
+        self.on_overlay_position_changed(x, y)
 
     def nudge_overlay(self, dx: int, dy: int):
         pos = self.overlay.pos()
@@ -2085,6 +2692,7 @@ class AudioRadarApp(QMainWindow):
         if not self._closing_for_exit:
             self._flush_pending_saves()
             self.hide()
+            self._schedule_dashboard_freeze()
             event.ignore()
             return
 
@@ -2095,6 +2703,7 @@ class AudioRadarApp(QMainWindow):
             )
 
         self._flush_pending_saves()
+        self._dashboard_freeze_timer.stop()
         if self._exit_finalized:
             logger.debug("closeEvent accepted after exit finalized")
             event.accept()
@@ -2234,7 +2843,29 @@ if __name__ == "__main__":
             logger.debug("AppUserModelID setup failed: %s", exc)
 
     qt_args = [arg for arg in sys.argv if arg != "--debug"]
+    # Keep fractional monitor scales (125%, 150%, ... ) instead of allowing
+    # Qt to round them to a neighbouring integer scale.  Rounding is especially
+    # visible in QtWebEngine: Chromium allocates a backing surface for the
+    # rounded DPR and Windows then stretches it to the actual monitor, making
+    # text look soft and leaving CSS geometry one or two pixels out of phase.
+    # This must be set before QApplication is constructed.
+    try:
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except (AttributeError, TypeError):
+        # Older Qt 6 builds may not expose the policy; their default policy is
+        # still preferable to preventing the dashboard from starting.
+        pass
     app = QApplication(qt_args)
+    primary_screen = app.primaryScreen()
+    if primary_screen is not None:
+        logger.debug(
+            "QtWebEngine scale configured initial_dpr=%.4f screen_dpr=%.4f flags=%s",
+            _initial_windows_scale(),
+            float(primary_screen.devicePixelRatio()),
+            os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", ""),
+        )
     single_instance_server = _acquire_single_instance()
     if single_instance_server is None:
         sys.exit(0)

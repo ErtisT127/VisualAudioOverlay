@@ -1,38 +1,35 @@
-# ── Local dev / notes / assets not needed to run v2 ──
-handoff.md
-feedback.md
-design/
-*.png
-# but DO track the README screenshot
-!docs/screenshot.png
-# and the app icon source
-!assets/icon.png
+# Runtime/user data
 profiles.json
 settings.json
-lifecycle.log
-# legacy UI; v2 lives in dashboard_v2/
-dashboard/
-.claude/
+*.log
 
-# ── Python ──
+# Generated images
+*.png
+!docs/screenshot.png
+!assets/icon.png
+
+# Python caches and virtual environments
 __pycache__/
 *.py[cod]
-*.pyo
+.pytest_cache/
+.ruff_cache/
 .venv/
 venv/
 env/
 
-# ── build output ──
+# Application and native build output
 dist/
 build/
+native/**/build*/
+native/**/*.dll*
+native/**/*.lib
+native/**/*.exp
+native/**/*.obj
+native/**/*.pdb
 
-# ── Editor / OS ──
+# Editor and operating-system files
 .idea/
+.vscode/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ── Personal / private - synced via private repo, keep out of public ──
-post.md
-# launch/marketing copy (reddit posts, itch page, devlogs)
-docs/marketing/

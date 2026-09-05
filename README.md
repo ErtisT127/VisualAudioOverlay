@@ -70,18 +70,7 @@ reads audio you are already playing, there is no interaction with the game itsel
 > true 7.1 / 8-channel device enables full 360 degree detection. A stereo device
 > can only resolve left vs. right.
 
-## Getting started (from source)
-
-```bash
-git clone https://github.com/ErtisT127/VisualAudioOverlay.git
-cd VisualAudioOverlay
-pip install -r requirements.txt
-python main.py
-```
-
-Requires **Windows 10 (build 19041+)** and **Python 3.10+**.
-
-### Quick start
+## Quick start
 
 1. Launch the app and pick your **Monitor** (where the radar appears).
 2. Choose a **Preset** that matches your game, or tune Sensitivity, Gain, and the
@@ -91,6 +80,8 @@ Requires **Windows 10 (build 19041+)** and **Python 3.10+**.
    audio. Leave it on **All (system audio)** to capture everything. The program
    must already be playing sound to appear in the list.
 5. Hit **Start** in the Radar panel. The overlay appears on your selected monitor.
+
+The dashboard can be minimized to the tray while the radar continues running.
 
 ## Mono output (single-sided listeners)
 
@@ -117,17 +108,33 @@ virtual audio cable, which the app then reads. We use **VB-CABLE** for this.
 > (www.vb-cable.com). VB-CABLE is donationware - donations are welcome. See
 > [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-## Build a one-file .exe
+## Getting started (from source)
 
 ```bash
+git clone https://github.com/ErtisT127/VisualAudioOverlay.git
+cd VisualAudioOverlay
 pip install -r requirements.txt -r requirements-build.txt
+cmake -S native/overlay_native -B native/overlay_native/build -G "MinGW Makefiles"
+cmake --build native/overlay_native/build --config Release --parallel
+python main.py
+```
+
+For a one-file build:
+
+```bash
 bash scripts/build_nuitka.sh
 ```
 
-The one-file build is written to `dist/nuitka/`, bundles the dashboard, icons,
-fonts, Qt WebEngine, and the dynamic audio/COM modules, and runs offline without
-a Python installation.
+## License
 
-The default release target is a one-file build for simpler distribution. A
-one-directory build can be produced by replacing `--onefile` with
-`--standalone`; it starts faster and avoids extracting Qt resources at launch.
+This repository is a fork of [Mike Zaugg's VisualAudioOverlay](https://github.com/mike-s-zaugg/VisualAudioOverlay).
+
+Copyright (c) 2026 Mike Zaugg.
+
+This project is **source-available**, not open source. It is licensed under the
+**Functional Source License, Version 1.1, MIT Future License (FSL-1.1-MIT)**. In
+short: you are free to use, modify, and contribute to the code for any purpose
+except building a competing product. Each release automatically becomes available
+under the permissive MIT license two years after it ships.
+
+See the [LICENSE](LICENSE) for the full terms.

@@ -39,6 +39,23 @@ if [[ ! -f "$soundcard_header" ]]; then
     exit 1
 fi
 
+native_source="$project_root/native/overlay_native"
+native_build="$native_source/build"
+if command -v mingw32-make >/dev/null 2>&1; then
+    cmake -S "$native_source" -B "$native_build" -G "MinGW Makefiles"
+else
+    cmake -S "$native_source" -B "$native_build"
+fi
+cmake --build "$native_build" --config Release --parallel
+native_dll="$(find "$native_build" -type f -iname 'overlay_native.dll' -print -quit)"
+if [[ -z "$native_dll" ]]; then
+    native_dll="$(find "$native_build" -type f -iname '*overlay_native.dll' ! -name '*.dll.a' -print -quit)"
+fi
+if [[ -z "$native_dll" || ! -f "$native_dll" ]]; then
+    printf '%s\n' "Native overlay build produced no overlay_native.dll." >&2
+    exit 1
+fi
+
 if ! qtwebengine_locale="$($python -c 'import os, PyQt6; print(os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "translations", "qtwebengine_locales", "en-US.pak"))')"; then
     printf '%s\n' "Could not locate the PyQt6 QtWebEngine locale package. Install requirements.txt first." >&2
     exit 1
@@ -52,6 +69,7 @@ fi
 nuitka_arguments=(
     "--include-data-files=$soundcard_header=soundcard/mediafoundation.py.h"
     "--include-data-files=$qtwebengine_locale=qtwebengine_locales/en-US.pak"
+    "--include-data-files=$native_dll=native/overlay_native.dll"
 )
 if [[ -d "$project_root/vendor" ]]; then
     nuitka_arguments+=("--include-data-dir=vendor=vendor")
