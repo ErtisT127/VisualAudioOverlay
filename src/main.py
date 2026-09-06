@@ -264,9 +264,9 @@ APP_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.png")
 TRAY_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
 
 # ── Version + project links ─────────────────────────────────────────────────
-# APP_VERSION must match the GitHub release tag (without the leading "v") for the
-# update check to compare correctly. Bump this for every release you tag.
-APP_VERSION = "0.2.3"
+# APP_VERSION is the release tag without its leading "v" (e.g. tag "v0.2.31"
+# matches APP_VERSION "0.2.31"). The comparison strips "vV" on both sides.
+APP_VERSION = "0.2.31"
 REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay"
 # Latest-release JSON (no auth needed; 60 req/hr per IP is plenty for one check
 # per launch). Used by the in-app update check to reach users who already have
@@ -458,6 +458,17 @@ def _save_json_mapping(path: str, data: dict) -> bool:
         if temporary_path:
             with contextlib.suppress(OSError):
                 os.unlink(temporary_path)
+
+
+def _find_screen_at_centre(screens, cx: float, cy: float):
+    """Screen whose geometry contains (cx, cy), or None when off every screen.
+
+    QRect.contains() only accepts whole pixels, so the fractional centre is
+    rounded before the point test (PyQt6 raises on a raw float)."""
+    for screen in screens:
+        if screen.geometry().contains(round(cx), round(cy)):
+            return screen
+    return None
 
 
 # ── Bridge ─────────────────────────────────────────────────────────────────
@@ -1530,7 +1541,7 @@ class AudioRadarApp(QMainWindow):
             runner = getattr(page, "runJavaScript", None)
             if runner is not None:
                 runner(
-                    "void document.documentElement.offsetWidth;"
+                    "void document.documentElement?.offsetWidth;"
                     "window.dispatchEvent(new Event('resize'));"
                     "if (typeof redrawPreview === 'function') "
                     "window.requestAnimationFrame(drawPreview);"
@@ -1757,20 +1768,68 @@ class AudioRadarApp(QMainWindow):
         if (x, y) != (int(self.overlay.pos().x()), int(self.overlay.pos().y())):
             self.overlay.move(x, y)
         logger.info("overlay position persisted x=%s y=%s", x, y)
-        self.settings["overlay_position"] = {"x": x, "y": y}
+        self._store_overlay_position(x, y)
         self._save_settings()
         self.emit_overlay_position()
+        self._follow_overlay_owner(x, y)
+
+    # Each monitor owns its own remembered placement, so a spot arranged on one
+    # screen is not clobbered when the overlay is moved or reset on another.
+    # settings["overlay_positions"] maps QScreen.name() -> {"x", "y"} in
+    # absolute virtual-desktop coordinates. The slot written is the screen the
+    # overlay centre actually sits on, not the dashboard selection, so dragging
+    # the overlay across a monitor boundary remembers it for the right screen.
+    def _overlay_positions_map(self):
+        """settings["overlay_positions"] (per-screen slots), initialised to an
+        empty map when a fresh settings file has no such key yet."""
+        mapping = self.settings.get("overlay_positions")
+        if not isinstance(mapping, dict):
+            mapping = {}
+            self.settings["overlay_positions"] = mapping
+        return mapping
+
+    def _screen_owner_name(self, x: int, y: int) -> str:
+        """Screen whose slot owns an overlay placed at (x, y): the screen under
+        the overlay centre. Falls back to the dashboard selection so a write
+        always lands somewhere (the centre is normally clamped onto a screen)."""
+        screens = QApplication.screens()
+        if screens:
+            owner = _find_screen_at_centre(screens, x + self.overlay.width() / 2, y + self.overlay.height() / 2)
+            if owner is not None:
+                return owner.name()
+            if 0 <= self.selected_monitor < len(screens):
+                return screens[self.selected_monitor].name()
+        return ""
+
+    def _store_overlay_position(self, x: int, y: int):
+        mapping = self._overlay_positions_map()
+        mapping[self._screen_owner_name(x, y)] = {"x": x, "y": y}
+
+    def _saved_overlay_position_for_screen(self, name):
+        """(x, y) remembered for one screen name, or None without a slot."""
+        if not name:
+            return None
+        entry = self._overlay_positions_map().get(name)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return int(entry["x"]), int(entry["y"])
+        except KeyError, TypeError, ValueError, OverflowError:
+            return None
 
     def on_overlay_position_preview(self, x: int, y: int):
         """Live drag frames: refresh the UI readout only, no disk write.
-        The final position is persisted once on mouse release via
-        on_overlay_position_changed (issue #3)."""
+        The monitor selection follows the overlay across a screen boundary
+        while the drag is in flight. The final position is persisted once on
+        mouse release via on_overlay_position_changed (issue #3)."""
+        x, y = int(x), int(y)
         state = {
-            "x": int(x),
-            "y": int(y),
+            "x": x,
+            "y": y,
             "drag_enabled": bool(self.overlay.drag_enabled),
         }
         self.bridge.overlayPositionChanged.emit(json.dumps(state))
+        self._follow_overlay_owner(x, y)
 
     def emit_overlay_position(self):
         pos = self.overlay.pos()
@@ -1780,6 +1839,25 @@ class AudioRadarApp(QMainWindow):
             "drag_enabled": bool(self.overlay.drag_enabled),
         }
         self.bridge.overlayPositionChanged.emit(json.dumps(state))
+
+    def _follow_overlay_owner(self, x: int, y: int):
+        """Retarget the monitor selection onto the screen the overlay centre
+        sits on, so dragging across an extended-desktop boundary moves the
+        dashboard dropdown (and CENTER) with the overlay instead of leaving
+        the old monitor selected. No-op while the centre is off every screen
+        or the owning screen cannot be matched back to an index."""
+        screens = QApplication.screens()
+        if not screens:
+            return
+        owner = _find_screen_at_centre(screens, x + self.overlay.width() / 2, y + self.overlay.height() / 2)
+        if owner is None or owner.name() == self._selected_monitor_name:
+            return
+        matching = next((i for i, screen in enumerate(screens) if screen.name() == owner.name()), None)
+        if matching is None:
+            return
+        self.selected_monitor = matching
+        self._selected_monitor_name = owner.name()
+        self.bridge.selectedMonitorChanged.emit(int(self.selected_monitor))
 
     # ── Programs (per-app capture) ────────────────────────────────────
     def set_program(self, program):
@@ -1822,7 +1900,7 @@ class AudioRadarApp(QMainWindow):
         self.bridge.monitorsChanged.emit(json.dumps(monitors))
 
     def set_monitor(self, idx):
-        """Select a monitor and move a visible overlay to that monitor."""
+        """Select a monitor and move a visible overlay to its remembered spot."""
         screens = QApplication.screens()
         try:
             idx = int(idx)
@@ -1834,7 +1912,18 @@ class AudioRadarApp(QMainWindow):
         self.selected_monitor = idx
         self._selected_monitor_name = screens[idx].name()
         if self.overlay.isVisible():
-            x, y = self._selected_monitor_center_position()
+            # Each monitor has its own slot: restore the spot arranged for it
+            # the last time, and centre on first visit. Both cases persist, so
+            # switching back and forth no longer clobbers the other screen.
+            screen = screens[idx]
+            saved = self._saved_overlay_position_for_screen(screen.name())
+            if saved is None:
+                x, y = self._selected_monitor_center_position()
+            else:
+                # A spot saved under this name may predate a topology change;
+                # pin it to the chosen monitor rather than letting the clamp
+                # follow a stale centre onto some other screen.
+                x, y = self._clamp_overlay_position(saved[0], saved[1], screen)
             self.overlay.move(x, y)
             self.on_overlay_position_changed(x, y)
         self.bridge.selectedMonitorChanged.emit(idx)
@@ -2371,7 +2460,10 @@ class AudioRadarApp(QMainWindow):
         if not screens:
             return 0, 0
         idx = self.selected_monitor if 0 <= self.selected_monitor < len(screens) else 0
-        geo = screens[idx].availableGeometry()
+        # Center on the full screen, not the work area: an overlay centered in
+        # the available geometry sits 24px high on a 1080p-class monitor with a
+        # 48px taskbar (half the taskbar height), i.e. above the true center.
+        geo = screens[idx].geometry()
         return (
             geo.x() + (geo.width() - self.overlay.width()) // 2,
             geo.y() + (geo.height() - self.overlay.height()) // 2,
@@ -2389,10 +2481,7 @@ class AudioRadarApp(QMainWindow):
         if screen is None:
             cx = x + self.overlay.width() / 2
             cy = y + self.overlay.height() / 2
-            screen = next(
-                (s for s in screens if s.geometry().contains(round(cx), round(cy))),
-                None,
-            )
+            screen = _find_screen_at_centre(screens, cx, cy)
         if screen is None:
             screen = screens[self.selected_monitor] if 0 <= self.selected_monitor < len(screens) else screens[0]
         geo = screen.availableGeometry()
@@ -2478,12 +2567,9 @@ class AudioRadarApp(QMainWindow):
             QTimer.singleShot(120, self._refresh_dashboard_viewport)
 
     def _saved_overlay_position_is_visible(self, pos):
-        if not isinstance(pos, dict) or "x" not in pos or "y" not in pos:
-            return False
-
         try:
-            x = int(pos["x"])
-            y = int(pos["y"])
+            x, y = pos
+            x, y = int(x), int(y)
         except TypeError, ValueError, OverflowError:
             return False
         width = self.overlay.width()
@@ -2498,22 +2584,25 @@ class AudioRadarApp(QMainWindow):
         return False
 
     def _place_overlay_for_start(self):
-        pos = self.settings.get("overlay_position")
         screens = QApplication.screens()
         selected = screens[self.selected_monitor] if screens and 0 <= self.selected_monitor < len(screens) else None
-        saved_on_selected = False
-        if selected is not None and isinstance(pos, dict):
-            try:
-                px, py = int(pos["x"]), int(pos["y"])
-                center = (px + self.overlay.width() // 2, py + self.overlay.height() // 2)
-                saved_on_selected = selected.geometry().contains(*center)
-            except KeyError, TypeError, ValueError, OverflowError:
-                saved_on_selected = False
-        if saved_on_selected and self._saved_overlay_position_is_visible(pos):
-            x, y = self._clamp_overlay_position(pos["x"], pos["y"], selected)
-            self.overlay.move(x, y)
-        else:
-            x, y = self._selected_monitor_center_position()
+        if selected is not None:
+            # Restore the placement remembered for the selected screen; the
+            # first session on a fresh monitor starts centred. The centre must
+            # sit on the selected screen (names can repeat across adapters), so
+            # a stale spot from a physically different screen still falls back.
+            saved = self._saved_overlay_position_for_screen(selected.name())
+            if (
+                saved is not None
+                and selected.geometry().contains(
+                    saved[0] + self.overlay.width() // 2,
+                    saved[1] + self.overlay.height() // 2,
+                )
+                and self._saved_overlay_position_is_visible(saved)
+            ):
+                x, y = self._clamp_overlay_position(saved[0], saved[1], selected)
+            else:
+                x, y = self._selected_monitor_center_position()
             self.overlay.move(x, y)
         self.emit_overlay_position()
 

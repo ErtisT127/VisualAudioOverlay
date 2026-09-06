@@ -17,14 +17,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -42,10 +46,24 @@ constexpr size_t kMaxBlips = 64;
 constexpr size_t kMaxEvents = 32;
 constexpr size_t kMaxCommands = 128;
 constexpr UINT_PTR kDecayTimer = 1;
+// After this many consecutive render() failures the render loop rebuilds the
+// whole graphics stack, and never more often than this debounce, so a
+// persistent per-frame failure cannot busy-loop on a dead device.
+constexpr uint32_t kRenderFailuresBeforeReinit = 10;
+constexpr uint64_t kRenderReinitDebounceMs = 500;
+// A blip that keeps receiving hits at its angle holds its level instead of
+// decaying, so sustained audio renders one steady frame instead of fighting a
+// 30 ms decay clock that never catches up.
+constexpr uint64_t kDecayHoldMs = 150;
 
 struct Blip {
     float angle = 0.0f;
     float life = 0.0f;
+    uint64_t last_hit_ms = 0;
+    // The 8-bit alpha level last submitted to the composition surface for this
+    // blip. Dirty detection compares against it so pixel-identical frames
+    // (same angle and level) skip the redraw entirely.
+    uint8_t shown_opacity = 0;
     ComPtr<ID2D1PathGeometry> geometry;
 };
 
@@ -54,9 +72,113 @@ inline float angle_diff(float a, float b) {
     return d > 180.0f ? 360.0f - d : d;
 }
 
+// QWidget painted with QColor(alpha=int(life * 255)). Keep the fade curve in
+// the same 255 discrete levels and compare levels, not raw life, when deciding
+// whether a frame would actually change pixels.
+inline uint8_t quantize_opacity(float life) {
+    return static_cast<uint8_t>(std::floor(std::max(0.0f, std::min(1.0f, life)) * 255.0f));
+}
+
+// Commit-pacing knobs are read from the environment so the update stream can
+// be varied (A/B) without rebuilding the DLL. Overlay diagnostics (init /
+// show / hide / recover / slow frames plus a 5 s stats summary) are appended
+// to a file only while a log path is set; with no path the render loop never
+// opens one.
+//
+// Read the real Windows environment block (GetEnvironmentVariableA) instead
+// of the CRT's cached copy: values set in-process by the Python side
+// (os.environ before vao_create, see native_overlay.py) are only visible
+// through the Windows block, while the CRT copy never updates after startup.
+std::string env_value(const char *name) {
+    const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+    if (needed == 0)
+        return {};
+    std::string value(needed, '\0');
+    const DWORD got = GetEnvironmentVariableA(name, value.data(), needed);
+    // needed counts the terminating NUL as well; drop it.
+    if (got == 0 || got >= needed)
+        return {};
+    value.resize(got);
+    return value;
+}
+
+bool env_flag(const char *name, bool fallback) {
+    const std::string v = env_value(name);
+    if (v.empty())
+        return fallback;
+    const char c = v.front();
+    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+}
+
+uint64_t env_u64(const char *name, uint64_t fallback) {
+    const std::string v = env_value(name);
+    if (v.empty())
+        return fallback;
+    char *end = nullptr;
+    const unsigned long long n = std::strtoull(v.c_str(), &end, 10);
+    return end && *end == '\0' ? n : fallback;
+}
+
+// Diag path parsing mirrors the sibling knobs' off convention: "0", "no" or
+// "false" (any case) turns diagnostics off instead of being mistaken for a
+// log path, "1" is shorthand for the default file name in the process
+// working directory, and any other value is a literal log path.  The Python
+// wrapper normally sets the full overlay.log path when app file logging is
+// on, so this env var only matters for manual shell usage.
+bool is_false_value(const std::string &value) {
+    std::string lower;
+    lower.reserve(value.size());
+    for (const char c : value)
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return lower == "0" || lower == "no" || lower == "false";
+}
+
+std::string diag_env_path() {
+    const std::string p = env_value("VAO_NATIVE_DIAG");
+    if (p.empty() || is_false_value(p))
+        return {};
+    return p == "1" ? std::string("overlay_native_diag.log") : p;
+}
+
+std::string hex_u32(uint32_t v) {
+    std::string s;
+    s.reserve(8);
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        const uint32_t nibble = (v >> shift) & 0xF;
+        s.push_back(nibble < 10 ? static_cast<char>('0' + nibble)
+                                : static_cast<char>('A' + nibble - 10));
+    }
+    return s;
+}
+
+// Wall-clock prefix for the diagnostics log, matching the ISO-style
+// timestamps the Python side writes to lifecycle.log. The render thread is a
+// single writer of debug lines, so lifecycle's pid/tid/level chrome adds no
+// information here.
+std::string padded(unsigned value, unsigned width) {
+    std::string s = std::to_string(value);
+    if (width > s.size())
+        s.insert(0, width - s.size(), '0');
+    return s;
+}
+
+std::string log_timestamp() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    return padded(st.wYear, 4) + "-" + padded(st.wMonth, 2) + "-" + padded(st.wDay, 2) + "T" +
+           padded(st.wHour, 2) + ":" + padded(st.wMinute, 2) + ":" + padded(st.wSecond, 2) + "." +
+           padded(st.wMilliseconds, 3);
+}
+
+// Diagnostics cap mirrors the Python lifecycle log: 2 MiB, then the file is
+// truncated in place (no backups kept).
+constexpr long kMaxLogBytes = 2 * 1024 * 1024;
+
 class Overlay {
   public:
-    Overlay() = default;
+    Overlay()
+        : dwmflush_(env_flag("VAO_RENDER_DWMFLUSH", true)),
+          render_interval_ms_(env_u64("VAO_RENDER_INTERVAL_MS", 0)), diag_path_(diag_env_path()) {}
     ~Overlay() { destroy(); }
 
     bool create() {
@@ -97,7 +219,10 @@ class Overlay {
         return command([this] {
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
             SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // Repaint immediately: hide() may have left the DComp surface with
+            // stale content and DWM only re-samples it after a Commit.
             dirty_ = true;
+            diag_write("show");
         });
     }
     int hide() {
@@ -114,6 +239,7 @@ class Overlay {
             blips_.clear();
             KillTimer(hwnd_, kDecayTimer);
             dirty_ = false;
+            diag_write("hide");
         });
     }
 
@@ -280,6 +406,8 @@ class Overlay {
             CoUninitialize();
             return;
         }
+        diag_write("init ok flush=" + std::string(dwmflush_ ? "1" : "0") +
+                   " interval_ms=" + std::to_string(render_interval_ms_));
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ready_ = true;
@@ -302,29 +430,67 @@ class Overlay {
             if (display_change_pending_ || (!d2d_context_ && now >= graphics_retry_at_)) {
                 // A mode switch or monitor hotplug can invalidate the DComp
                 // target without immediately returning DXGI_ERROR_DEVICE_*.
-                // Recreate the device/swapchain on the render thread so the
+                // Recreate the device/surface on the render thread so the
                 // existing HWND and latest blips survive the transition.
                 display_change_pending_ = false;
-                release_graphics();
-                if (!init_graphics()) {
-                    // A projection switch can leave the adapter unavailable
-                    // briefly. Keep the HWND alive and retry instead of
-                    // permanently blanking the overlay after one transient
-                    // initialization failure.
-                    graphics_retry_at_ = now + 200;
-                } else {
-                    graphics_retry_at_ = 0;
-                }
-                dirty_ = true;
+                reinit_graphics(now);
             }
             if (!blips_.empty() && now >= next_decay_) {
-                decay_blips();
-                next_decay_ = blips_.empty() ? 0 : now + 30;
+                decay_blips(now);
             }
-            if (dirty_ || (!blips_.empty() && now >= next_present_)) {
-                render();
-                next_present_ = now + 30;
-                dirty_ = false;
+            // Content reaches DWM through an IDCompositionSurface that DWM
+            // samples at composition time: there is no swap chain and no flip
+            // queue to pace, so a frame is committed only when the 255-level
+            // opacity/arc set actually changed (dirty_). render() keeps dirty_
+            // set when it bailed so the missed frame stays pending.
+            //
+            // Pacing (VAO_RENDER_DWMFLUSH / VAO_RENDER_INTERVAL_MS) stops the
+            // stream from bursting at audio pace: an unsettled cadence of
+            // commits over a flip-model game is what the overlay degrades
+            // (game-only flicker after minutes that a ~45 s commit pause
+            // clears), so by default every Commit is followed by DwmFlush(),
+            // phase-locking commits to DWM's composition clock.
+            bool due = render_interval_ms_ == 0 || now >= next_render_at_;
+            if (due && dirty_ && d2d_context_) {
+                const uint64_t r_start = GetTickCount64();
+                const bool rendered = render();
+                const uint64_t r_ms = GetTickCount64() - r_start;
+                if (rendered) {
+                    dirty_ = false;
+                    ++renders_ok_;
+                    consecutive_render_failures_ = 0;
+                    if (render_interval_ms_ != 0)
+                        next_render_at_ = GetTickCount64() + render_interval_ms_;
+                } else {
+                    ++renders_failed_;
+                    const uint64_t failed_at = GetTickCount64();
+                    // A persistent per-frame failure that no recover path
+                    // turns into a device rebuild (e.g. CreateSurface failing
+                    // with a non-device error) must not spin at tick rate
+                    // forever: after a run of failures, rebuild the whole
+                    // stack, but not more often than the debounce allows.
+                    if (++consecutive_render_failures_ >= kRenderFailuresBeforeReinit &&
+                        failed_at - last_reinit_at_ >= kRenderReinitDebounceMs) {
+                        consecutive_render_failures_ = 0;
+                        last_reinit_at_ = failed_at;
+                        reinit_graphics(failed_at);
+                    }
+                }
+                if (r_ms >= 50)
+                    diag_write("slow_render ms=" + std::to_string(r_ms) +
+                               " rendered=" + std::string(rendered ? "1" : "0"));
+            }
+            // Stats tick only while the radar window is visible: the thread
+            // lives for the whole process (stop merely hides), and a heartbeat
+            // of frozen counters after "hide" is noise.  Events (show/hide/
+            // recover/slow_render) still record the transitions themselves.
+            if (IsWindowVisible(hwnd_) && now - diag_last_ >= 5000) {
+                diag_last_ = now;
+                diag_write("stats renders_ok=" + std::to_string(renders_ok_) +
+                           " renders_fail=" + std::to_string(renders_failed_) + " audio_pkts=" +
+                           std::to_string(audio_pkts_) + " recovers=" + std::to_string(recovers_) +
+                           " blips=" + std::to_string(blips_.size()) +
+                           " dirty=" + std::string(dirty_ ? "1" : "0"));
             }
             std::unique_lock<std::mutex> lock(mutex_);
             wake_cv_.wait_for(lock, std::chrono::milliseconds(5),
@@ -454,46 +620,83 @@ class Overlay {
             return;
         if (audio->generation < generation_)
             return;
+        ++audio_pkts_;
+        const uint64_t now = GetTickCount64();
         if (audio->generation > generation_) {
             generation_ = audio->generation;
-            blips_.clear();
-            next_decay_ = 0;
+            // A new capture session invalidates every visible result from the
+            // previous worker, so drop them and clear the surface.
+            if (!blips_.empty()) {
+                blips_.clear();
+                next_decay_ = 0;
+                dirty_ = true;
+            }
         }
-        float life = std::min(1.0f, audio->intensity * kVisualGain);
+        const float life = std::min(1.0f, audio->intensity * kVisualGain);
+        if (quantize_opacity(life) == 0)
+            return; // Below the first visible alpha level; nothing to draw.
+        bool changed = false;
         bool merged = false;
         for (auto &blip : blips_) {
             if (angle_diff(blip.angle, audio->angle) < 20.0f) {
-                blip.life = std::max(blip.life, life);
+                // A hit refreshes the decay hold even when it does not move
+                // the level, so steady audio stays on one rendered frame.
+                blip.last_hit_ms = now;
+                if (life > blip.life) {
+                    blip.life = life;
+                    if (quantize_opacity(blip.life) != blip.shown_opacity)
+                        changed = true;
+                }
                 merged = true;
                 break;
             }
         }
         if (!merged) {
-            blips_.push_back(Blip{audio->angle, life});
-            if (blips_.size() > kMaxBlips)
-                blips_.erase(blips_.begin(), blips_.begin() + static_cast<std::ptrdiff_t>(
-                                                                  blips_.size() - kMaxBlips));
+            if (blips_.size() >= kMaxBlips)
+                blips_.erase(blips_.begin()); // The push below repaints anyway.
+            Blip blip;
+            blip.angle = audio->angle;
+            blip.life = life;
+            blip.last_hit_ms = now;
+            blips_.push_back(blip);
+            changed = true;
         }
-        dirty_ = true;
+        // Mark dirty only when the frame would differ from the last present
+        // (quantized alpha moved, or an arc appeared/disappeared).
+        if (changed)
+            dirty_ = true;
         // Decay is an independent 30 ms clock. Do not postpone it on every
         // audio packet: changing directions must let older blips fade while
         // new packets continue to arrive.
-        if (next_decay_ == 0)
-            next_decay_ = GetTickCount64() + 30;
+        if (next_decay_ == 0 && !blips_.empty())
+            next_decay_ = now + 30;
     }
 
-    void decay_blips() {
-        for (auto &blip : blips_)
+    void decay_blips(uint64_t now) {
+        bool changed = false;
+        for (auto &blip : blips_) {
+            if (blip.last_hit_ms != 0 && now - blip.last_hit_ms < kDecayHoldMs)
+                continue; // Still fed by audio; keep the level steady.
+            blip.last_hit_ms = 0;
             blip.life -= kDecay;
+            if (quantize_opacity(blip.life) != blip.shown_opacity)
+                changed = true;
+        }
+        const size_t before = blips_.size();
         blips_.erase(std::remove_if(blips_.begin(), blips_.end(),
                                     [](const Blip &b) { return b.life <= 0.0f; }),
                      blips_.end());
+        if (blips_.size() != before)
+            changed = true;
         // Even when the final blip expires, a transparent frame must be
         // submitted to clear the previous composition surface.  Leaving
         // dirty_ false here makes the last arc remain visible indefinitely.
-        dirty_ = true;
+        if (changed)
+            dirty_ = true;
         if (blips_.empty())
             next_decay_ = 0;
+        else
+            next_decay_ = now + 30;
     }
 
     bool init_graphics() {
@@ -513,11 +716,6 @@ class Overlay {
         if (FAILED(hr))
             return false;
         if (FAILED(d3d_device_.As(&dxgi_device_)))
-            return false;
-        ComPtr<IDXGIAdapter> adapter;
-        if (FAILED(dxgi_device_->GetAdapter(&adapter)))
-            return false;
-        if (FAILED(adapter->GetParent(IID_PPV_ARGS(&dxgi_factory_))))
             return false;
         if (FAILED(D2D1CreateFactory(
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
@@ -552,52 +750,33 @@ class Overlay {
             return false;
         if (FAILED(dcomp_target_->SetRoot(dcomp_visual_.Get())))
             return false;
-        return recreate_swapchain();
+        return SUCCEEDED(create_content_surface());
     }
 
-    bool recreate_swapchain() {
-        if (!dxgi_factory_)
-            return false;
-        d2d_context_->SetTarget(nullptr);
-        target_bitmap_.Reset();
-        swapchain_.Reset();
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = static_cast<UINT>(width_);
-        desc.Height = static_cast<UINT>(height_);
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        HRESULT hr = dxgi_factory_->CreateSwapChainForComposition(d3d_device_.Get(), &desc, nullptr,
-                                                                  &swapchain_);
+    // DWM samples this surface at composition time instead of us flipping a
+    // swap chain to it. A flip-model chain floating over a composed fullscreen
+    // game contends with the game's own planes (MPO / independent-flip
+    // fallback churn), which surfaces as whole-screen jitter after minutes; a
+    // plain surface never claims a plane or queues frames, so redrawing is
+    // just a Commit DWM picks up on its next frame.
+    HRESULT create_content_surface() {
+        if (!dcomp_device_)
+            return E_FAIL;
+        HRESULT hr = dcomp_device_->CreateSurface(
+            static_cast<UINT>(width_), static_cast<UINT>(height_), DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_ALPHA_MODE_PREMULTIPLIED, &dcomp_surface_);
         if (FAILED(hr))
-            return false;
-        // Keep the overlay in the same SDR/P709 space as the legacy QWidget
-        // surface. Without an explicit color space, an HDR desktop can apply a
-        // different SDR white level and make otherwise identical alpha strokes
-        // appear noticeably dimmer.
-        ComPtr<IDXGISwapChain3> swapchain3;
-        if (SUCCEEDED(swapchain_.As(&swapchain3))) {
-            swapchain3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            return hr;
+        hr = dcomp_visual_->SetContent(dcomp_surface_.Get());
+        if (SUCCEEDED(hr))
+            hr = dcomp_device_->Commit();
+        if (FAILED(hr)) {
+            dcomp_surface_.Reset();
+            recreate_target_ = true;
+            return hr;
         }
-        if (FAILED(dcomp_visual_->SetContent(swapchain_.Get())))
-            return false;
-        if (FAILED(dcomp_device_->Commit()))
-            return false;
-        ComPtr<IDXGISurface> surface;
-        if (FAILED(swapchain_->GetBuffer(0, IID_PPV_ARGS(&surface))))
-            return false;
-        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        if (FAILED(
-                d2d_context_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target_bitmap_)))
-            return false;
-        d2d_context_->SetTarget(target_bitmap_.Get());
         recreate_target_ = false;
-        return true;
+        return S_OK;
     }
 
     bool ensure_blip_geometry(Blip &blip) {
@@ -628,12 +807,63 @@ class Overlay {
         return true;
     }
 
-    void render() {
-        if (recreate_target_ && !recreate_swapchain())
-            return;
+    // Returns true when the new content reached the composition tree. On
+    // failure the caller keeps dirty_ set so the state that was not drawn
+    // stays pending.
+    bool render() {
         if (!d2d_context_)
-            return;
+            return false;
+        if (recreate_target_) {
+            // The surface is size-immutable and can be invalidated by a
+            // display/DPI change or a graphics-driver reset. Drop the old one
+            // so the next step builds it fresh.
+            d2d_context_->SetTarget(nullptr);
+            dcomp_surface_.Reset();
+            recreate_target_ = false;
+        }
+        if (!dcomp_surface_) {
+            const HRESULT surface_hr = create_content_surface();
+            if (FAILED(surface_hr)) {
+                // A failed (re)creation is a graphics-stack error like any
+                // other: device-removal classes must rebuild the whole stack,
+                // and without this the overlay would silently retry every tick
+                // on a dead DComp device and stay blank forever.
+                recover_from_graphics_error(surface_hr, GetTickCount64());
+                return false;
+            }
+        }
+        ComPtr<IDXGISurface> surface;
+        POINT surface_offset{};
+        HRESULT hr = dcomp_surface_->BeginDraw(nullptr, IID_PPV_ARGS(&surface), &surface_offset);
+        if (FAILED(hr)) {
+            recover_from_graphics_error(hr, GetTickCount64());
+            return false;
+        }
+        // DirectComposition discards each update's backing memory after
+        // EndDraw and may hand out a different buffer on every BeginDraw, so
+        // the D2D target must wrap this update's surface only.  Reusing a
+        // bitmap from an earlier frame would draw into a buffer DWM no longer
+        // samples, and the overlay would never appear.  The buffer handed out
+        // is a large shared texture (an arena); CANNOT_DRAW is required there
+        // - D2D rejects wrapping it with a plain TARGET bitmap.
+        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f,
+            96.0f, nullptr);
+        ComPtr<ID2D1Bitmap1> target;
+        hr = d2d_context_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target);
+        if (FAILED(hr)) {
+            dcomp_surface_->EndDraw();
+            recover_from_graphics_error(hr, GetTickCount64());
+            return false;
+        }
+        d2d_context_->SetTarget(target.Get());
         d2d_context_->BeginDraw();
+        // The update object is a slice of the backing arena; BeginDraw reports
+        // where that slice starts, and the whole frame must be drawn there.
+        // Every coordinate below stays surface-relative under this transform.
+        d2d_context_->SetTransform(D2D1::Matrix3x2F::Translation(
+            static_cast<float>(surface_offset.x), static_cast<float>(surface_offset.y)));
         // Match QPainter's default SourceOver composition explicitly. This is
         // important for a premultiplied target: replacing it with COPY would
         // make translucent strokes look either washed out or fully opaque.
@@ -663,15 +893,16 @@ class Overlay {
         d2d_context_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), base.Get(),
                                   2.0f);
         for (auto &blip : blips_) {
-            // QWidget used QColor(alpha=int(life * 255)); quantize the D2D
-            // opacity the same way so the fade curve and short-blip brightness
-            // remain visually identical at each 30 ms tick.
-            float opacity = std::floor(std::max(0.0f, std::min(1.0f, blip.life)) * 255.0f) / 255.0f;
-            brush->SetOpacity(opacity);
+            // QWidget used QColor(alpha=int(life * 255)). Draw at the same
+            // 255-level opacity and record the level actually submitted, so
+            // the dirty detection upstream skips pixel-identical frames.
+            const uint8_t level = quantize_opacity(blip.life);
+            brush->SetOpacity(static_cast<float>(level) / 255.0f);
             if (!ensure_blip_geometry(blip))
                 continue;
             d2d_context_->DrawGeometry(blip.geometry.Get(), brush.Get(), stroke_width_,
                                        round_stroke_.Get());
+            blip.shown_opacity = level;
         }
         if (drag_enabled_) {
             ComPtr<ID2D1SolidColorBrush> setup;
@@ -681,50 +912,108 @@ class Overlay {
                 1.0f, dash_stroke_.Get());
         }
         const HRESULT draw_hr = d2d_context_->EndDraw();
-        if (draw_hr == D2DERR_RECREATE_TARGET) {
-            // The compositor can invalidate the target during a display/DPI
-            // change or a graphics-driver reset.  Recreate it on the next
-            // render tick instead of leaving the overlay stuck on its last
-            // frame.
-            target_bitmap_.Reset();
-            recreate_target_ = true;
-            dirty_ = true;
-            return;
-        }
+        d2d_context_->SetTarget(nullptr);
+        // Release the surface lock even when D2D failed; only the result below
+        // decides whether the content reached DWM.
+        const HRESULT end_hr = dcomp_surface_->EndDraw();
         if (FAILED(draw_hr)) {
-            dirty_ = true;
-            return;
+            // A lost device surfaces here as D2DERR_RECREATE_TARGET or a
+            // generic EndDraw failure (device died mid-batch).  Route both
+            // through the recover path: device-removal classes rebuild the
+            // stack, anything else just forces a fresh target next tick.
+            recover_from_graphics_error(draw_hr, GetTickCount64());
+            return false;
         }
-        // The render loop already limits submissions to dirty changes and a
-        // 30 ms cadence. Avoid waiting for the monitor vblank here: a sync
-        // interval of 1 makes the native thread block behind DWM when the GPU
-        // is busy, which is exactly the contention this backend is intended to
-        // avoid.
-        const HRESULT present_hr = swapchain_->Present(0, 0);
-        if (FAILED(present_hr)) {
-            recover_from_graphics_error(present_hr);
-            dirty_ = true;
-            return;
+        if (FAILED(end_hr)) {
+            recover_from_graphics_error(end_hr, GetTickCount64());
+            return false;
         }
+        // Publish the surface update; DWM samples it on its next composition
+        // frame. There is no vsync wait and no flip queue here, so the commit
+        // can never stall this thread behind the game's presentation.
         const HRESULT commit_hr = dcomp_device_->Commit();
         if (FAILED(commit_hr)) {
-            recover_from_graphics_error(commit_hr);
-            dirty_ = true;
+            recover_from_graphics_error(commit_hr, GetTickCount64());
+            return false;
         }
+        if (dwmflush_) {
+            // Wait until DWM composes this update before the next one starts,
+            // so commits arrive one per composition frame, evenly spaced and
+            // phase-locked to the display clock.  Skip the wait when DWM is
+            // not composing (session switch/remote disconnect): the wait has
+            // no timeout and must not wedge the render thread behind a dead
+            // compositor, which would also hang vao_destroy's join at exit.
+            BOOL composing = FALSE;
+            if (SUCCEEDED(DwmIsCompositionEnabled(&composing)) && composing) {
+                const HRESULT flush_hr = DwmFlush();
+                if (FAILED(flush_hr)) {
+                    const uint64_t now = GetTickCount64();
+                    if (now - last_dwm_diag_at_ >= 5000) {
+                        last_dwm_diag_at_ = now;
+                        diag_write("dwm_flush hr=0x" + hex_u32(static_cast<uint32_t>(flush_hr)));
+                    }
+                }
+            }
+        }
+        return true;
     }
 
-    void recover_from_graphics_error(HRESULT hr) {
+    // Recreate the whole graphics stack after a display change, a device
+    // removal/reset (TDR) or a failed init. The first failure retries after
+    // 200 ms; every further failure doubles the wait up to 2 s, so a driver
+    // that stays down cannot busy-loop this thread against it while the game
+    // fights to recover its own device.
+    bool reinit_graphics(uint64_t now) {
+        release_graphics();
+        if (!init_graphics()) {
+            graphics_retry_at_ = now + recovery_delay_ms_;
+            recovery_delay_ms_ = std::min(recovery_delay_ms_ * 2, 2000ULL);
+            return false;
+        }
+        recovery_delay_ms_ = 200;
+        graphics_retry_at_ = 0;
+        // The old surfaces are gone: force every blip to repaint from zero on
+        // the next tick instead of comparing against stale shown_opacity.
+        for (auto &blip : blips_)
+            blip.shown_opacity = 0;
+        dirty_ = true;
+        return true;
+    }
+
+    void recover_from_graphics_error(HRESULT hr, uint64_t now) {
+        ++recovers_;
+        diag_write("recover hr=0x" + hex_u32(static_cast<uint32_t>(hr)));
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-            release_graphics();
-            if (!init_graphics()) {
-                graphics_retry_at_ = GetTickCount64() + 200;
-                return;
-            }
-            graphics_retry_at_ = 0;
+            reinit_graphics(now);
             return;
         }
-        target_bitmap_.Reset();
         recreate_target_ = true;
+        dirty_ = true;
+    }
+
+    // Overlay diagnostics (VAO_NATIVE_DIAG / overlay.log under app debug):
+    // append one wall-clock-prefixed line per event or stats tick. Every
+    // writer runs on the render thread, so no locking is needed.
+    void diag_write(const std::string &line) {
+        if (diag_path_.empty())
+            return;
+        FILE *f = fopen(diag_path_.c_str(), "ab");
+        if (!f)
+            return;
+        if (std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) >= kMaxLogBytes) {
+            // Cap mirrors the Python lifecycle log (2 MiB).  Delete the file
+            // instead of truncating it in place: deleting frees the old space
+            // before the next write, so a full disk cannot erase the log and
+            // then fail to record the line that crossed the cap.
+            std::fclose(f);
+            std::remove(diag_path_.c_str());
+            f = fopen(diag_path_.c_str(), "ab");
+            if (!f)
+                return;
+        }
+        const std::string out = log_timestamp() + " " + line + "\n";
+        std::fwrite(out.data(), 1, out.size(), f);
+        std::fclose(f);
     }
 
     void release_graphics() {
@@ -732,8 +1021,7 @@ class Overlay {
             d2d_context_->SetTarget(nullptr);
         for (auto &blip : blips_)
             blip.geometry.Reset();
-        target_bitmap_.Reset();
-        swapchain_.Reset();
+        dcomp_surface_.Reset();
         round_stroke_.Reset();
         dash_stroke_.Reset();
         dcomp_visual_.Reset();
@@ -742,7 +1030,6 @@ class Overlay {
         d2d_context_.Reset();
         d2d_device_.Reset();
         d2d_factory_.Reset();
-        dxgi_factory_.Reset();
         dxgi_device_.Reset();
         d3d_context_.Reset();
         d3d_device_.Reset();
@@ -779,23 +1066,33 @@ class Overlay {
     bool dirty_ = true;
     bool recreate_target_ = false;
     bool display_change_pending_ = false;
+    bool dwmflush_ = true;
+    uint64_t render_interval_ms_ = 0;
+    uint64_t next_render_at_ = 0;
     uint64_t graphics_retry_at_ = 0;
+    uint64_t recovery_delay_ms_ = 200;
+    uint32_t consecutive_render_failures_ = 0;
+    uint64_t last_reinit_at_ = 0;
+    uint64_t last_dwm_diag_at_ = 0;
     uint64_t generation_ = 0;
     uint32_t color_ = 0x9751F2FF;
     float stroke_width_ = 6.0f;
     uint64_t next_decay_ = 0;
-    uint64_t next_present_ = 0;
     std::vector<Blip> blips_;
+    std::string diag_path_;
+    uint64_t diag_last_ = 0;
+    uint64_t renders_ok_ = 0;
+    uint64_t renders_failed_ = 0;
+    uint64_t audio_pkts_ = 0;
+    uint64_t recovers_ = 0;
 
     ComPtr<ID3D11Device> d3d_device_;
     ComPtr<ID3D11DeviceContext> d3d_context_;
     ComPtr<IDXGIDevice> dxgi_device_;
-    ComPtr<IDXGIFactory2> dxgi_factory_;
-    ComPtr<IDXGISwapChain1> swapchain_;
+    ComPtr<IDCompositionSurface> dcomp_surface_;
     ComPtr<ID2D1Factory1> d2d_factory_;
     ComPtr<ID2D1Device> d2d_device_;
     ComPtr<ID2D1DeviceContext> d2d_context_;
-    ComPtr<ID2D1Bitmap1> target_bitmap_;
     ComPtr<ID2D1StrokeStyle> round_stroke_;
     ComPtr<ID2D1StrokeStyle> dash_stroke_;
     ComPtr<IDCompositionDevice> dcomp_device_;

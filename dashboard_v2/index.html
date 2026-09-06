@@ -30,12 +30,28 @@
               <img src="icons/monitor.svg" class="icon" alt="" />
               <span>Monitor</span>
             </div>
-            <div class="select-wrap">
-              <select
+            <!-- Live dropdown: a DOM menu, not a native <select>. QtWebEngine
+                 draws native select popups as unstyled Qt widgets that cannot
+                 be rebuilt while open - every list on this panel is a DOM
+                 menu instead, so it follows the dark theme and refreshes in
+                 place even while open (that is how a game starting audio
+                 mid-session shows up). -->
+            <div class="live-field">
+              <button
+                type="button"
                 id="monitor-select"
-                class="select"
-                onchange="AR.setMonitor(this.value)"
-              ></select>
+                class="select live-select"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+              >
+                <span id="monitor-select-label" class="live-label"></span>
+              </button>
+              <div
+                id="monitor-select-menu"
+                class="live-menu"
+                role="listbox"
+                aria-labelledby="monitor-select"
+              ></div>
             </div>
           </div>
 
@@ -195,12 +211,25 @@
               <span>Preset</span>
             </div>
             <div class="preset-row">
-              <div class="select-wrap select-wrap--grow">
-                <select
+              <!-- Live dropdown like monitor/program, so the preset list
+                   matches the theme (a native popup here would render as an
+                   unstyled Qt widget) and can rebuild safely at any time. -->
+              <div class="live-field">
+                <button
+                  type="button"
                   id="preset-select"
-                  class="select"
-                  onchange="AR.applyPreset(this.value)"
-                ></select>
+                  class="select live-select"
+                  aria-haspopup="listbox"
+                  aria-expanded="false"
+                >
+                  <span id="preset-select-label" class="live-label"></span>
+                </button>
+                <div
+                  id="preset-select-menu"
+                  class="live-menu"
+                  role="listbox"
+                  aria-labelledby="preset-select"
+                ></div>
               </div>
               <button
                 id="preset-new-btn"
@@ -270,12 +299,24 @@
 
           <div class="field">
             <div class="field-label"><span>Program</span></div>
-            <div class="select-wrap">
-              <select
+            <div class="live-field">
+              <button
+                type="button"
                 id="program-select"
-                class="select"
-                onchange="AR.setProgram(this.value)"
-              ></select>
+                class="select live-select"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+              >
+                <span id="program-select-label" class="live-label"></span>
+              </button>
+              <!-- Grows downward like the other menus; .row .card lets the
+                   panel escape the card edge and overlay the card below. -->
+              <div
+                id="program-select-menu"
+                class="live-menu"
+                role="listbox"
+                aria-labelledby="program-select"
+              ></div>
             </div>
           </div>
         </section>
@@ -624,12 +665,22 @@
 
         <div class="field">
           <div class="field-label"><span>Mono plays to</span></div>
-          <div class="select-wrap">
-            <select
+          <div class="live-field">
+            <button
+              type="button"
               id="mono-output-select"
-              class="select"
-              onchange="AR.setMonoOutput(this.value)"
-            ></select>
+              class="select live-select"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+            >
+              <span id="mono-output-select-label" class="live-label"></span>
+            </button>
+            <div
+              id="mono-output-select-menu"
+              class="live-menu"
+              role="listbox"
+              aria-labelledby="mono-output-select"
+            ></div>
           </div>
           <div class="device-sub" style="margin-top: 6px">
             Pick your real headphones here, not the virtual cable.

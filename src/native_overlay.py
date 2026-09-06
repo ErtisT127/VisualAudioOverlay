@@ -10,6 +10,21 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QPoint, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
+from app_logging import LOG_ENABLED_ENV, LOG_PATH_ENV, get_logger
+
+logger = get_logger("overlay")
+
+# Native overlay diagnostics follow the same switch as the Python lifecycle
+# log (LOG_ENABLED_ENV), which the app resolves as "uv run/dev logs by
+# default; packaged builds log only with --debug".  While it is on, the C++
+# render thread appends events to overlay.log next to the lifecycle log.  The
+# DLL reads VAO_NATIVE_DIAG from the Windows environment block (never the CRT
+# copy, which does not update after startup) at vao_create time, so set it
+# before creating the handle.  Leaving it unset keeps the render loop free of
+# any file I/O.
+_DIAG_ENV = "VAO_NATIVE_DIAG"
+_DIAG_FILE = "overlay.log"
+
 
 class _VaoEvent(ctypes.Structure):
     _fields_ = [
@@ -42,6 +57,12 @@ class NativeOverlay(QObject):
         # physical-pixel Win32 window.
         self._physical_coordinates = isinstance(self._dll, ctypes.CDLL)
         self._bind_api()
+        # Native diagnostics: append render-thread events to overlay.log (next
+        # to the lifecycle log) whenever app file logging is on.  An
+        # explicitly exported VAO_NATIVE_DIAG always wins over that default.
+        diag_path = self._diag_log_path()
+        if diag_path:
+            os.environ.setdefault(_DIAG_ENV, diag_path)
         self._handle = self._dll.vao_create()
         if not self._handle:
             raise RuntimeError("DirectComposition overlay initialization failed")
@@ -94,6 +115,21 @@ class NativeOverlay(QObject):
                     continue
         searched = ", ".join(str(path) for path in candidates)
         raise RuntimeError(f"Native overlay DLL not found or unloadable: {searched}")
+
+    @staticmethod
+    def _diag_log_path() -> str | None:
+        """Path for native diagnostics while app file logging is on.
+
+        Returns ``<lifecycle log dir>/overlay.log`` when logging is enabled
+        (dev runs always; packaged builds with --debug), otherwise None so
+        the render thread never touches a file.
+        """
+        if os.environ.get(LOG_ENABLED_ENV) != "1":
+            return None
+        log_path = os.environ.get(LOG_PATH_ENV)
+        if not log_path:
+            return None
+        return os.path.join(os.path.dirname(log_path), _DIAG_FILE)
 
     def _bind_api(self):
         self._dll.vao_create.argtypes = []
@@ -157,8 +193,8 @@ class NativeOverlay(QObject):
         self._poll_timer.start()
 
     def hide(self):
-        if self._handle:
-            self._dll.vao_hide(self._handle)
+        if self._handle and not self._dll.vao_hide(self._handle) and self._visible:
+            logger.warning("native overlay hide rejected: render thread not running")
         self._visible = False
         self._poll_timer.stop()
 
@@ -203,6 +239,15 @@ class NativeOverlay(QObject):
             logical_geo = screen.geometry()
             native_x = native_rect[0] + round((self._x - logical_geo.x()) * scale)
             native_y = native_rect[1] + round((self._y - logical_geo.y()) * scale)
+        elif screen is not None:
+            # The physical monitor rect is unknown (enumeration or matching
+            # failed) but the owning QScreen is.  Anchor to the screen's own
+            # logical origin, as the primary branch anchors to its physical
+            # origin, instead of scaling from the global origin, which drifts
+            # on mixed-DPI desktops.
+            logical_geo = screen.geometry()
+            native_x = round(logical_geo.x() + (self._x - logical_geo.x()) * scale)
+            native_y = round(logical_geo.y() + (self._y - logical_geo.y()) * scale)
         else:
             native_x = round(self._x * scale)
             native_y = round(self._y * scale)
@@ -370,8 +415,17 @@ class NativeOverlay(QObject):
                             round(geo.x() + (native_x - rect[0]) / scale),
                             round(geo.y() + (native_y - rect[1]) / scale),
                         )
-        scale = self._scale_for_point(native_x / self._native_scale, native_y / self._native_scale)
-        return round(native_x / scale), round(native_y / scale)
+        # No monitor rect matched this point.  Mirror the screen-anchored
+        # mapping _set_geometry uses when the owning screen is known, and fall
+        # back to the global origin otherwise.
+        guess_x = native_x / self._native_scale
+        guess_y = native_y / self._native_scale
+        screen, _ = self._screen_mapping(guess_x, guess_y)
+        scale = self._screen_scale(screen) if screen is not None else self._scale_for_point(guess_x, guess_y)
+        if screen is None:
+            return round(native_x / scale), round(native_y / scale)
+        geo = screen.geometry()
+        return round(geo.x() + (native_x - geo.x()) / scale), round(geo.y() + (native_y - geo.y()) / scale)
 
     def set_drag_enabled(self, enabled):
         enabled = bool(enabled)
@@ -399,13 +453,14 @@ class NativeOverlay(QObject):
     def update_audio_data(self, angle, intensity, generation=None):
         if generation is None:
             generation = self._generation
-        self._dll.vao_submit_audio(
+        if not self._dll.vao_submit_audio(
             self._handle,
             int(generation),
             float(angle),
             float(intensity),
             0,
-        )
+        ):
+            logger.warning("native audio submit rejected: render thread not running")
 
     def _poll_events(self):
         event = _VaoEvent()

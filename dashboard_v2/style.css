@@ -150,6 +150,12 @@ body::before {
   min-height: 0;
   overflow: hidden;
 }
+/* The three row cards host live dropdowns; an open menu near a card's bottom
+   edge (Program is the last field) grows past it, so let the menu overlay the
+   card below instead of being clipped to the card's rounded box. */
+.row .card {
+  overflow: visible;
+}
 .card--custom {
   flex: none;
   padding-top: 12px;
@@ -359,6 +365,20 @@ body::before {
   padding: 24px 28px;
   box-shadow: none;
 }
+.modal-card::-webkit-scrollbar {
+  width: 10px;
+}
+.modal-card::-webkit-scrollbar-track {
+  background: transparent;
+}
+.modal-card::-webkit-scrollbar-thumb {
+  background: #3f3f3f;
+  border: 2px solid var(--card);
+  border-radius: 5px;
+}
+.modal-card::-webkit-scrollbar-thumb:hover {
+  background: #555555;
+}
 .modal-title {
   font-size: 22px;
   font-weight: 800;
@@ -518,14 +538,6 @@ body::before {
 }
 
 /* ── Selects (pill dropdowns) ──────────────────────────────────── */
-.select-wrap {
-  position: relative;
-  display: inline-block;
-}
-.select-wrap--grow {
-  flex: 1 1 auto;
-}
-
 .select {
   width: 100%;
   appearance: none;
@@ -548,6 +560,91 @@ body::before {
 }
 .select:hover {
   background-color: #2a2a2a;
+}
+
+/* Live dropdowns: DOM menus standing in for native <select>s, whose Qt popup
+   cannot be themed or rebuilt while open in QtWebEngine. Every select on the
+   panel (monitor / program / preset / mono) uses this control, so the pill
+   trigger mirrors .select above and the menu reuses the same dark tokens.
+   Menus grow downward like a native popup and size to their longest row
+   (min-width keeps them at least as wide as the trigger). */
+.live-field {
+  position: relative;
+}
+.live-select {
+  display: block;
+  text-align: left;
+}
+.live-select:focus-visible {
+  outline: 2px solid rgba(0, 157, 255, 0.55);
+  outline-offset: 1px;
+}
+.live-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-menu {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 40; /* above sibling card content, below modals (z ~339) */
+  display: none;
+  width: max-content;
+  min-width: 100%;
+  max-width: min(520px, calc(100vw - 88px));
+  padding: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: #161616;
+  border: 1px solid #3a3a3a;
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
+  font-size: 15px;
+}
+.live-menu.is-open {
+  display: block;
+}
+/* Themed scrollbar for long lists (many presets / devices). Always drawn
+   when the menu overflows its 320px cap, inset so it never covers text. */
+.live-menu::-webkit-scrollbar {
+  width: 10px;
+}
+.live-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+.live-menu::-webkit-scrollbar-thumb {
+  background: #3f3f3f;
+  border: 2px solid #161616;
+  border-radius: 5px;
+}
+.live-menu::-webkit-scrollbar-thumb:hover {
+  background: #555555;
+}
+.live-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: 500 15px var(--font);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.live-option:hover,
+.live-option:focus-visible {
+  background: #2a2a2a;
+  outline: none;
+}
+.live-option.is-selected {
+  background: rgba(0, 157, 255, 0.16);
 }
 
 /* ── Sliders (single) ──────────────────────────────────────────── */
@@ -633,7 +730,7 @@ body::before {
   width: 100%;
   max-width: 100%;
 }
-.preset-row .select-wrap--grow {
+.preset-row .live-field {
   flex: 0 1 auto;
   width: min(calc((100% - 28px) / 2), calc(100% - 182px));
   min-width: 0;

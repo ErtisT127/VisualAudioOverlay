@@ -104,13 +104,10 @@ function initBridge() {
       // The Program list only contains apps that are currently playing audio.
       // Re-enumerate whenever the user returns to this window (e.g. alt-tabs
       // back from the game), so a game launched after startup shows up without
-      // having to Start the radar first.
-      //
-      // Skipped while any <select> popup is open - it is the popup itself
-      // stealing and returning focus, and answering that churn with a
-      // blocking COM enumeration is what grew the list. See isSelectOpen.
+      // having to Start the radar first. (All dropdowns are DOM menus now, so
+      // a refresh can never hit an open native popup - see the history note
+      // next to the deferred-fill machinery that used to guard this.)
       window.addEventListener("focus", () => {
-        if (isSelectOpen()) return;
         AR.refreshDropdowns();
       });
 
@@ -324,15 +321,14 @@ function onDeviceChanged(label) {
 }
 
 function onMonitorsChanged(jsonStr) {
-  fillSelect(
+  liveFill(
     "monitor-select",
     JSON.parse(jsonStr).map((m) => ({ value: m.idx, label: m.name })),
   );
 }
 
 function onSelectedMonitorChanged(idx) {
-  const sel = document.getElementById("monitor-select");
-  if (sel) sel.value = String(idx);
+  liveSelect("monitor-select", String(idx));
 }
 
 function onPresetsChanged(jsonStr) {
@@ -369,20 +365,131 @@ function onSelectedPresetChanged(name) {
 function onProgramsChanged(jsonStr) {
   const progs = JSON.parse(jsonStr);
   // Diff-guard: refresh fires on dropdown-open and on every window focus, so
-  // identical lists arrive repeatedly. Rebuilding a native <select> while its
-  // popup is open makes QtWebEngine grow the rendered list (the runaway
-  // dropdown bug). Skip the DOM rebuild entirely when nothing changed.
+  // identical lists arrive repeatedly. Skip the DOM rebuild when nothing
+  // changed - the live menu could take a rebuild at any time, but avoiding
+  // one spares the churn on a list the user may be pointing at.
   const sig = progs.join("\u0000");
   if (sig === window._programsSig) return;
   window._programsSig = sig;
 
-  // No preferred value: fillSelect keeps whatever the user has selected, and
+  // No preferred value: liveFill keeps whatever the user has selected, and
   // falls back to the first option ("All (system audio)") if that program has
   // stopped playing and dropped off the list.
-  fillSelect("program-select", [
+  liveFill("program-select", [
     { value: "all", label: "All (system audio)" },
     ...progs.map((p) => ({ value: p, label: p })),
   ]);
+}
+
+// ── Live dropdowns (every select on the panel) ───────────────────────
+// All four lists (monitor / program / preset / mono output) are plain DOM
+// menus instead of native <select>s. A native popup cannot be themed or
+// rebuilt while open in QtWebEngine, which is exactly when a session list
+// must NOT wait: monitors connect and games start playing audio while the
+// panel is up. A DOM menu has no such restriction, so opening a list asks
+// the backend for a fresh enumeration where one exists, and any signal reply
+// re-renders the menu in place while it is still open.
+//
+// State lives in `liveFields`; all DOM access is best-effort so the model can
+// be exercised without real elements (see tests/test_dropdowns.js).
+const liveFields = {};
+
+function liveField(id) {
+  return liveFields[id] || (liveFields[id] = { options: [], selected: null, open: false });
+}
+
+function liveOptions(id) {
+  return liveFields[id] ? liveFields[id].options.slice() : [];
+}
+
+function liveSelected(id) {
+  const field = liveFields[id];
+  return field ? field.selected : null;
+}
+
+function liveIsOpen(id) {
+  const field = liveFields[id];
+  return field ? field.open : false;
+}
+
+// Read-only views of the live-dropdown state, exported for the regression
+// tests (which load this file without a real DOM).
+window.liveOptions = liveOptions;
+window.liveSelected = liveSelected;
+window.liveIsOpen = liveIsOpen;
+
+// Backend pushed a fresh option list. `preferred` (when given and present in
+// the list) outranks the current selection; otherwise the current pick is
+// kept while it still exists, falling back to the first entry - the native
+// <select> this replaces ended up on its first option the same way.
+function liveFill(id, options, preferred) {
+  const field = liveField(id);
+  const keep = field.selected == null ? null : String(field.selected);
+  const want =
+    preferred != null && options.some((o) => String(o.value) === String(preferred))
+      ? String(preferred)
+      : keep != null && options.some((o) => String(o.value) === keep)
+        ? keep
+        : options.length
+          ? String(options[0].value)
+          : null;
+  field.options = options.map((o) => ({ value: String(o.value), label: String(o.label) }));
+  field.selected = want;
+  liveRender(id);
+}
+
+// Backend pushed the authoritative selection. It can arrive before its list,
+// so it is stored as-is; liveFill re-validates it once options land.
+function liveSelect(id, value) {
+  if (value == null) return;
+  liveField(id).selected = String(value);
+  liveRender(id);
+}
+
+function liveRender(id) {
+  const field = liveFields[id];
+  if (!field) return;
+  const pick = field.options.find((o) => o.value === field.selected) || field.options[0];
+  const labelEl = document.getElementById(id + "-label");
+  if (labelEl) {
+    labelEl.textContent = pick ? pick.label : "";
+    labelEl.title = pick ? pick.label : "";
+  }
+  const menuEl = document.getElementById(id + "-menu");
+  if (menuEl && typeof menuEl.replaceChildren === "function") {
+    menuEl.replaceChildren();
+    if (field.open) {
+      field.options.forEach((o) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "live-option";
+        btn.textContent = o.label;
+        btn.title = o.label; // rows truncate past the menu cap; hover shows all
+        btn.addEventListener("click", () => AR.pickLiveOption(id, o.value));
+        btn.setAttribute("role", "option");
+        const selected = o.value === field.selected;
+        btn.setAttribute("aria-selected", selected ? "true" : "false");
+        if (selected) btn.classList.add("is-selected");
+        menuEl.appendChild(btn);
+      });
+    }
+  }
+  if (menuEl) menuEl.classList?.toggle?.("is-open", field.open);
+  const triggerEl = document.getElementById(id);
+  triggerEl?.setAttribute?.("aria-expanded", field.open ? "true" : "false");
+}
+
+function liveIsOpenAny() {
+  return Object.keys(liveFields).some((id) => liveFields[id].open);
+}
+
+function liveCloseAll() {
+  Object.keys(liveFields).forEach((id) => {
+    if (liveFields[id].open) {
+      liveFields[id].open = false;
+      liveRender(id);
+    }
+  });
 }
 
 // Saved overlay appearance (accent colour + thickness) restored from settings.json.
@@ -443,9 +550,9 @@ function onMonoStateChanged(jsonStr) {
     { value: "", label: "System default" + (s.default ? ` (${s.default})` : "") },
     ...(s.devices || []).map((d) => ({ value: d, label: d })),
   ];
-  // "" is a real option value here (System default), so pass it through rather
-  // than letting it fall back to the current pick.
-  fillSelect("mono-output-select", opts, s.selected || "");
+  // "" is a real option value here (System default), so it is passed through
+  // as the preferred pick rather than being treated as "no selection".
+  liveFill("mono-output-select", opts, s.selected || "");
 
   const cb = document.getElementById("mono-enabled");
   if (cb) cb.checked = !!s.enabled;
@@ -504,19 +611,18 @@ function rebuildPresetSelects() {
   // name that no longer exists (a profile deleted since) falls back to the
   // current pick rather than dropping the dropdown to its first entry.
   const saved = window._presetRestored ? null : window._savedPreset;
-  const keep = document.getElementById("preset-select")?.value;
+  const current = liveSelected("preset-select");
   const stateId = presetState.id;
-  const want =
-    saved && opts.some((o) => o.value === saved)
-      ? saved
-      : opts.some((o) => o.value === stateId)
-        ? stateId
-        : opts.some((o) => o.value === keep)
-          ? keep
-          : opts[0]?.value;
-  // The restore replay is registered as this select's settled hook, so it also
-  // runs when the rebuild had to be deferred past an open popup.
-  fillSelect("preset-select", opts, want);
+  const has = (v) => v != null && opts.some((o) => o.value === v);
+  const want = has(saved)
+    ? saved
+    : has(stateId)
+      ? stateId
+      : has(current)
+        ? current
+        : opts[0]?.value;
+  liveFill("preset-select", opts, want);
+  maybeRestorePreset();
 }
 
 function markPresetDirty() {
@@ -590,8 +696,7 @@ function maybeRestorePreset() {
   if (window._presetRestored) return;
   const name = window._savedPreset;
   if (!name) return;
-  const sel = document.getElementById("preset-select");
-  if (!sel || sel.value !== name) return; // not in the dropdown (yet)
+  if (liveSelected("preset-select") !== name) return; // not in the list (yet)
   window._presetRestored = true;
 }
 
@@ -926,8 +1031,7 @@ window.AR = {
   },
 
   deletePreset() {
-    const sel = document.getElementById("preset-select");
-    const id = sel?.value;
+    const id = liveSelected("preset-select");
     if (!id || !id.startsWith("profile:")) return;
     const name = id.slice(8);
     if (!name) return;
@@ -972,25 +1076,63 @@ window.AR = {
 
   refreshDropdown(id) {
     if (window._dashboardFrozen || document.hidden) return;
-    const now = Date.now();
-    if (_lastDropdownRefresh[id] && now - _lastDropdownRefresh[id] < 250) {
+    // Only monitor/program lists come from the backend's live enumeration;
+    // preset and mono lists arrive on their own signals, so opening those
+    // menus needs no round-trip.
+    if (id !== "monitor-select" && id !== "program-select") {
       resetDropdownRefreshTimer();
       return;
     }
-    _lastDropdownRefresh[id] = now;
+    const now = Date.now();
+    if (window._lastDropdownRefresh[id] && now - window._lastDropdownRefresh[id] < 250) {
+      resetDropdownRefreshTimer();
+      return;
+    }
+    window._lastDropdownRefresh[id] = now;
     if (id === "monitor-select") AR.refreshMonitors();
     else if (id === "program-select") AR.refreshPrograms();
     resetDropdownRefreshTimer();
   },
 
   refreshDropdowns() {
-    if (window._dashboardFrozen || document.hidden || isSelectOpen()) {
+    if (window._dashboardFrozen || document.hidden) {
       resetDropdownRefreshTimer();
       return;
     }
+    // Live menus tolerate an in-place rebuild, so the idle poll and the
+    // window-focus refresh no longer need to dodge an open popup.
     AR.refreshMonitors();
     AR.refreshPrograms();
     resetDropdownRefreshTimer();
+  },
+
+  // ── Live dropdowns (Monitor / Program) ───────────────────────────
+  toggleLiveSelect(id) {
+    if (window._dashboardFrozen || document.hidden) return;
+    const field = liveField(id);
+    field.open = !field.open;
+    // Opening re-enumerates (250ms-debounced), so a monitor connected or a
+    // game started since the last lookup shows up in the list right away.
+    if (field.open) AR.refreshDropdown(id);
+    liveRender(id);
+  },
+
+  closeLiveSelect(id) {
+    const field = liveFields[id];
+    if (!field || !field.open) return;
+    field.open = false;
+    liveRender(id);
+  },
+
+  pickLiveOption(id, value) {
+    liveSelect(id, value);
+    AR.closeLiveSelect(id);
+    const trigger = document.getElementById(id);
+    if (trigger && typeof trigger.focus === "function") trigger.focus();
+    if (id === "monitor-select") AR.setMonitor(parseInt(value));
+    else if (id === "program-select") AR.setProgram(value);
+    else if (id === "mono-output-select") AR.setMonoOutput(value);
+    else if (id === "preset-select") AR.applyPreset(value);
   },
 
   // ── Mono output ────────────────────────────────────────────────
@@ -1234,9 +1376,6 @@ function intVal(id, def) {
   const el = document.getElementById(id);
   return el ? parseInt(el.value) : def;
 }
-// Rebuilds queued because their <select> was open at the time:
-// { id: {opts, preferred} }.
-const _pendingFills = {};
 
 // Dropdowns are refreshed on demand when opened, with a low-rate visible-page
 // poll as a backstop for monitor/program changes that happen while the panel is
@@ -1244,7 +1383,9 @@ const _pendingFills = {};
 // or Frozen; opening a select then restarts the same idle interval.
 const DROPDOWN_REFRESH_IDLE_MS = 10000;
 let _dropdownRefreshTimer = null;
-const _lastDropdownRefresh = {};
+// Hosted on window like the other cross-signal latches so tests can clear the
+// 250ms open-dedupe window between scenarios.
+window._lastDropdownRefresh = window._lastDropdownRefresh || {};
 
 function stopDropdownRefreshTimer() {
   if (_dropdownRefreshTimer !== null && typeof window.clearTimeout === "function") {
@@ -1273,93 +1414,25 @@ function resetDropdownRefreshTimer() {
 // guaranteed to change for every tray/minimize path.
 window.setDashboardFrozen = function (frozen) {
   window._dashboardFrozen = !!frozen;
-  if (window._dashboardFrozen) stopDropdownRefreshTimer();
-  else scheduleDropdownRefresh();
+  if (window._dashboardFrozen) {
+    liveCloseAll();
+    stopDropdownRefreshTimer();
+  } else {
+    scheduleDropdownRefresh();
+  }
 };
 
-// Follow-up work to run once a select's options have actually landed in the DOM.
-// Registered per id so a *deferred* fill still triggers what its caller expected
-// to happen right after the rebuild.
-const _fillSettled = { "preset-select": maybeRestorePreset };
-
-// QtWebEngine draws <select> popups natively (that is why the open list is white
-// instead of following our dark CSS - the popup is a Qt widget, not DOM). Two
-// consequences, and both feed the runaway-dropdown bug:
+// History: QtWebEngine draws native <select> popups as unstyled Qt widgets,
+// and swapping options while a popup was open made Qt GROW the rendered list
+// (the runaway-dropdown bug) while the popup focus-churn retriggered a
+// blocking COM enumeration on every window focus. 49b828f diff-guarded the
+// program list; monitor and program moved to in-place-rebuildable DOM menus;
+// and now every select on the panel (preset and mono-output included) is a
+// DOM menu (see the Live dropdowns section), so no deferral machinery
+// remains - fills always land immediately, open or not.
 //
-//   1. Swapping the options while the popup is open makes Qt GROW the rendered
-//      list instead of redrawing it, leaving a blank strip under the real
-//      entries that gets taller with every rebuild.
-//   2. The popup is a separate window, so opening it takes focus off the web
-//      view and hands it straight back, repeatedly, for as long as it stays
-//      open - and the focus handler answered every round with a blocking COM
-//      enumeration whose reply rebuilt the very list being displayed.
-//
-// `document.activeElement` stays on the <select> for as long as its popup is up,
-// so it answers both questions. It also stays there after the popup closes until
-// focus moves on, which only makes this over-cautious, never wrong.
-//
-// 49b828f fixed one instance by diff-guarding the program list, but that only
-// helps while the list is unchanged - any real change (a game starting or
-// stopping audio) still rebuilt an open popup. This is the general fix and
-// covers every dropdown, so it protects the preset list too.
-function isSelectOpen(sel) {
-  const active = document.activeElement;
-  if (!active || active.tagName !== "SELECT") return false;
-  return sel ? active === sel : true;
-}
-
-// Replace a <select>'s options. `preferred` is the value to end up selected;
-// omit it to keep the current pick. See applySelectOptions for the fallbacks.
-function fillSelect(id, opts, preferred) {
-  const sel = document.getElementById(id);
-  if (!sel) return;
-  if (isSelectOpen(sel)) {
-    // Flush on change AND blur: picking an entry closes the popup without
-    // blurring, and clicking away blurs without a change. `once` is safe
-    // because we only re-arm when another fill is queued.
-    if (!(id in _pendingFills)) {
-      sel.addEventListener("change", () => flushSelectFill(id, true), { once: true });
-      sel.addEventListener("blur", () => flushSelectFill(id), { once: true });
-    }
-    _pendingFills[id] = { opts, preferred };
-    return;
-  }
-  delete _pendingFills[id];
-  applySelectOptions(sel, opts, preferred);
-  _fillSettled[id]?.();
-}
-
-// Apply a rebuild that was deferred while the popup was open. `userPicked` marks
-// the flush as triggered by the user choosing an entry, so their choice outranks
-// whatever value the queued rebuild wanted.
-function flushSelectFill(id, userPicked) {
-  if (!(id in _pendingFills)) return;
-  const { opts, preferred } = _pendingFills[id];
-  delete _pendingFills[id];
-  const sel = document.getElementById(id);
-  if (!sel) return;
-  applySelectOptions(sel, opts, userPicked ? sel.value : preferred);
-  _fillSettled[id]?.();
-}
-
-// Which entry ends up selected: `preferred` when the caller named one, else the
-// value already showing. Either way it is only assigned if the new list actually
-// contains it - assigning a value with no matching <option> leaves selectedIndex
-// at -1, which renders as an empty dropdown. Falling through to the first option
-// is what a rebuilt select does on its own; the explicit line just makes that
-// contract visible rather than inherited.
-function applySelectOptions(sel, opts, preferred) {
-  const want = preferred == null ? sel.value : String(preferred);
-  sel.innerHTML = "";
-  opts.forEach((o) => {
-    const opt = document.createElement("option");
-    opt.value = o.value;
-    opt.textContent = o.label;
-    sel.appendChild(opt);
-  });
-  if (opts.some((o) => String(o.value) === want)) sel.value = want;
-  else if (opts.length) sel.selectedIndex = 0;
-}
+// `_pendingFills` (deferred native-select rebuilds) was removed along with
+// the last native <select>.
 
 // Paint the filled portion of a single slider via the --fill CSS var.
 function setFill(id, val, min, max) {
@@ -1447,6 +1520,26 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+// Close any open live dropdown on Escape (a no-op while a modal is up - the
+// handler above consumed the event first).
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !liveIsOpenAny()) return;
+  event.preventDefault();
+  liveCloseAll();
+});
+
+// Clicking anywhere outside an open live dropdown dismisses it.
+document.addEventListener("pointerdown", (event) => {
+  const openIds = Object.keys(liveFields).filter((id) => liveFields[id].open);
+  if (!openIds.length) return;
+  const target = event.target;
+  const inside =
+    target &&
+    typeof target.closest === "function" &&
+    openIds.some((id) => target.closest(`#${id}, #${id}-menu`));
+  if (!inside) liveCloseAll();
+});
+
 document.addEventListener("selectstart", (event) => {
   if (!isEditableTarget(event.target)) event.preventDefault();
 });
@@ -1458,16 +1551,41 @@ document.addEventListener("contextmenu", (event) => {
 // ── Bootstrap ──────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", function () {
   // Default program option until/unless backend sends a list
-  fillSelect("program-select", [{ value: "all", label: "All (system audio)" }]);
+  liveFill("program-select", [{ value: "all", label: "All (system audio)" }]);
 
-  // A native <select> popup is opened before its change event fires. Refresh
-  // at that boundary so newly connected monitors/programs are available in
-  // the popup without rebuilding it continuously while it is open.
-  ["monitor-select", "program-select"].forEach((id) => {
-    const select = document.getElementById(id);
-    if (!select) return;
-    select.addEventListener("mousedown", () => AR.refreshDropdown(id));
-    select.addEventListener("focus", () => AR.refreshDropdown(id));
+  // Live menus: click opens (and always re-enumerates while opening). Arrow
+  // keys on the closed trigger open it like a native popup would.
+  ["monitor-select", "program-select", "preset-select", "mono-output-select"].forEach((id) => {
+    const trigger = document.getElementById(id);
+    if (!trigger) return;
+    trigger.addEventListener("click", () => AR.toggleLiveSelect(id));
+    trigger.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      if (liveIsOpen(id)) return; // arrows belong to the open menu
+      event.preventDefault();
+      AR.toggleLiveSelect(id);
+    });
+    const menu = document.getElementById(id + "-menu");
+    if (!menu || typeof menu.addEventListener !== "function") return;
+    // In-menu navigation: the options are real focusable buttons, but mirror
+    // the arrow-key feel of a native popup while one is focused.
+    menu.addEventListener("keydown", (event) => {
+      if (!menu.querySelectorAll) return;
+      const opts = Array.from(menu.querySelectorAll(".live-option"));
+      if (!opts.length) return;
+      let idx = opts.indexOf(document.activeElement);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        idx = idx === -1 ? (event.key === "ArrowDown" ? -1 : opts.length) : idx;
+        idx = event.key === "ArrowDown" ? Math.min(idx + 1, opts.length - 1) : Math.max(idx - 1, 0);
+      } else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        idx = event.key === "Home" ? 0 : opts.length - 1;
+      } else {
+        return;
+      }
+      if (idx >= 0 && opts[idx].focus) opts[idx].focus();
+    });
   });
   scheduleDropdownRefresh();
 
@@ -1481,6 +1599,7 @@ document.addEventListener("DOMContentLoaded", function () {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       clearPressedHotkeys();
+      liveCloseAll();
       stopDropdownRefreshTimer();
     } else {
       AR.refreshDropdowns();
