@@ -817,5 +817,80 @@ check(
     /preset-delete-modal[\s\S]*?onclick="AR\.closePresetDeleteModal\(\)"/.test(html),
 );
 
+// ── 14. Per-app gate: unsupported OS disables the program dropdown ──────
+section("per-app gate (unsupported OS)");
+calls.splice(0);
+W.onProgramsSupportedChanged(false);
+check("gate flags the field", W.liveDisabled("program-select"));
+check(
+  "trigger is aria-disabled",
+  els["program-select"]["aria-disabled"] === "true",
+  els["program-select"]["aria-disabled"],
+);
+check(
+  "trigger carries the is-disabled class",
+  els["program-select"].classList.contains("is-disabled"),
+);
+check(
+  "trigger hover title explains the gate",
+  /Windows 11/.test(els["program-select"].title || ""),
+  els["program-select"].title,
+);
+check(
+  "label hover title explains the gate too",
+  /Windows 11/.test(labelEl("program-select").title || ""),
+  labelEl("program-select").title,
+);
+check(
+  "selection stays on All (system audio)",
+  W.liveSelected("program-select") === "all",
+  W.liveSelected("program-select"),
+);
+
+// Interacting with the gated field must be inert: no open, no re-enumeration.
+W.AR.toggleLiveSelect("program-select");
+check("gated toggle does not open", !W.liveIsOpen("program-select"));
+check("gated toggle asks for no fresh list", !hasCall("refresh_programs"), JSON.stringify(calls));
+calls.splice(0);
+W.AR.pickLiveOption("program-select", "Discord.exe");
+check("gated pick is ignored", W.liveSelected("program-select") === "all");
+check("gated pick tells the backend nothing", calls.length === 0, JSON.stringify(calls));
+
+// A stale list push while gated must not resurrect the field.
+W._programsSig = null;
+calls.splice(0);
+W.onProgramsChanged(JSON.stringify(["Discord.exe"]));
+check("list push keeps the field gated", W.liveDisabled("program-select"));
+check(
+  "list push keeps the aria-disabled state",
+  els["program-select"]["aria-disabled"] === "true",
+  els["program-select"]["aria-disabled"],
+);
+
+// Supported OS re-arms the field, clears the gate chrome and restores titles.
+W.onProgramsSupportedChanged(true);
+check("gate lifts the flag", !W.liveDisabled("program-select"));
+check(
+  "trigger clears aria-disabled",
+  els["program-select"]["aria-disabled"] === "false",
+  els["program-select"]["aria-disabled"],
+);
+check(
+  "trigger drops the is-disabled class",
+  !els["program-select"].classList.contains("is-disabled"),
+);
+check("trigger clears the gate title", (els["program-select"].title || "") === "");
+check(
+  "label title returns to the current pick",
+  labelEl("program-select").title === "All (system audio)",
+  labelEl("program-select").title,
+);
+calls.splice(0);
+W._lastDropdownRefresh = {}; // reset the open-debounce; earlier toggles are sub-250ms old
+W.AR.toggleLiveSelect("program-select");
+check("supported toggle opens again", W.liveIsOpen("program-select"));
+check("supported toggle asks for a fresh list", hasCall("refresh_programs"), JSON.stringify(calls));
+W.AR.closeLiveSelect("program-select");
+
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

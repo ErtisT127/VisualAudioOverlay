@@ -15,6 +15,7 @@
  *
  *   set_program(str)            - per-app capture target
  *   programsChanged(jsonStr)    - list of running audio programs
+ *   programsSupportedChanged(bool) - per-app capture available on this OS; gates the dropdown
  *
  *   set_selected_preset(str)      - persist the dropdown choice to settings.json
  *   selectedPresetChanged(str)    - selected option state as JSON
@@ -81,6 +82,8 @@ function initBridge() {
       bridge.overlayPositionChanged.connect(onOverlayPositionChanged);
       // Optional new signals - only connect if the backend provides them.
       if (bridge.programsChanged) bridge.programsChanged.connect(onProgramsChanged);
+      if (bridge.programsSupportedChanged)
+        bridge.programsSupportedChanged.connect(onProgramsSupportedChanged);
       if (bridge.monoStateChanged) bridge.monoStateChanged.connect(onMonoStateChanged);
       if (bridge.updateAvailable) bridge.updateAvailable.connect(onUpdateAvailable);
       if (bridge.appearanceChanged) bridge.appearanceChanged.connect(onAppearanceChanged);
@@ -381,6 +384,17 @@ function onProgramsChanged(jsonStr) {
   ]);
 }
 
+// Backend probed per-app capture support. On an unsupported OS the program
+// dropdown is gated (aria-disabled + hover title shows why) - never silently
+// re-targeted, never re-enabled. Lists only arrive while supported anyway.
+function onProgramsSupportedChanged(supported) {
+  const field = liveField("program-select");
+  field.disabled = !supported;
+  field.reason = supported ? "" : PER_APP_REQUIRES_WIN11;
+  if (!supported) AR.closeLiveSelect("program-select");
+  liveRender("program-select");
+}
+
 // ── Live dropdowns (every select on the panel) ───────────────────────
 // All four lists (monitor / program / preset / mono output) are plain DOM
 // menus instead of native <select>s. A native popup cannot be themed or
@@ -393,6 +407,10 @@ function onProgramsChanged(jsonStr) {
 // State lives in `liveFields`; all DOM access is best-effort so the model can
 // be exercised without real elements (see tests/test_dropdowns.js).
 const liveFields = {};
+
+// Shown when the OS cannot capture a per-app target; mirrors the backend
+// gate message in main.py so the hover title says exactly what Start reports.
+const PER_APP_REQUIRES_WIN11 = "Per-app capture requires Windows 11 - switch to All (system audio)";
 
 function liveField(id) {
   return liveFields[id] || (liveFields[id] = { options: [], selected: null, open: false });
@@ -412,11 +430,17 @@ function liveIsOpen(id) {
   return field ? field.open : false;
 }
 
+function liveDisabled(id) {
+  const field = liveFields[id];
+  return field ? !!field.disabled : false;
+}
+
 // Read-only views of the live-dropdown state, exported for the regression
 // tests (which load this file without a real DOM).
 window.liveOptions = liveOptions;
 window.liveSelected = liveSelected;
 window.liveIsOpen = liveIsOpen;
+window.liveDisabled = liveDisabled;
 
 // Backend pushed a fresh option list. `preferred` (when given and present in
 // the list) outranks the current selection; otherwise the current pick is
@@ -449,11 +473,17 @@ function liveSelect(id, value) {
 function liveRender(id) {
   const field = liveFields[id];
   if (!field) return;
+  if (field.disabled && field.open) field.open = false;
   const pick = field.options.find((o) => o.value === field.selected) || field.options[0];
   const labelEl = document.getElementById(id + "-label");
   if (labelEl) {
     labelEl.textContent = pick ? pick.label : "";
-    labelEl.title = pick ? pick.label : "";
+    // A gated field carries the reason as the hover title on both parts.
+    labelEl.title = field.disabled
+      ? field.reason || PER_APP_REQUIRES_WIN11
+      : pick
+        ? pick.label
+        : "";
   }
   const menuEl = document.getElementById(id + "-menu");
   if (menuEl && typeof menuEl.replaceChildren === "function") {
@@ -477,6 +507,11 @@ function liveRender(id) {
   if (menuEl) menuEl.classList?.toggle?.("is-open", field.open);
   const triggerEl = document.getElementById(id);
   triggerEl?.setAttribute?.("aria-expanded", field.open ? "true" : "false");
+  if (triggerEl) {
+    triggerEl.setAttribute("aria-disabled", field.disabled ? "true" : "false");
+    triggerEl.title = field.disabled ? field.reason || PER_APP_REQUIRES_WIN11 : "";
+    triggerEl.classList.toggle("is-disabled", !!field.disabled);
+  }
 }
 
 function liveIsOpenAny() {
@@ -1110,6 +1145,7 @@ window.AR = {
   toggleLiveSelect(id) {
     if (window._dashboardFrozen || document.hidden) return;
     const field = liveField(id);
+    if (field.disabled) return;
     field.open = !field.open;
     // Opening re-enumerates (250ms-debounced), so a monitor connected or a
     // game started since the last lookup shows up in the list right away.
@@ -1125,6 +1161,7 @@ window.AR = {
   },
 
   pickLiveOption(id, value) {
+    if (liveField(id).disabled) return;
     liveSelect(id, value);
     AR.closeLiveSelect(id);
     const trigger = document.getElementById(id);

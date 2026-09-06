@@ -109,6 +109,12 @@ virtual audio cable, which the app then reads. We use **VB-CABLE** for this.
 > (www.vb-cable.com). VB-CABLE is donationware - donations are welcome. See
 > [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
+## Known issues
+
+**Bluetooth A2DP headsets:** "All (system audio)" may receive silence or a much
+weaker signal (Windows Bluetooth-stack behavior, not an app bug). Use **Program**
+capture instead, or a wired / virtual-cable endpoint.
+
 ## Getting started (from source)
 
 ```bash

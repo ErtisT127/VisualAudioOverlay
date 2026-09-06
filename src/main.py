@@ -525,15 +525,30 @@ class ProgramListThread(QThread):
     """Enumerate audio sessions off the GUI thread (COM/WASAPI may block)."""
 
     result = pyqtSignal(str)
+    capability = pyqtSignal(bool)
 
     def run(self):
+        # Probe per-app support first (cheap OS check); the frontend gates the
+        # program dropdown on it. Enumeration is pointless when unsupported.
+        supported = False
         try:
-            from process_loopback import list_audio_programs
+            from process_loopback import is_supported
 
-            names = [p["name"] for p in list_audio_programs()]
+            supported = is_supported()
         except Exception:
-            logger.exception("Program enumeration failed")
-            names = []
+            logger.exception("Per-app capability probe failed")
+        if self.isInterruptionRequested():
+            return
+        self.capability.emit(supported)
+        names = []
+        if supported and not self.isInterruptionRequested():
+            try:
+                from process_loopback import list_audio_programs
+
+                names = [p["name"] for p in list_audio_programs()]
+            except Exception:
+                logger.exception("Program enumeration failed")
+                names = []
         if not self.isInterruptionRequested():
             self.result.emit(json.dumps(names))
 
@@ -821,6 +836,7 @@ class Bridge(QObject):
     selectedMonitorChanged = pyqtSignal(int)
     presetsChanged = pyqtSignal(str)  # permanent builtin catalog as JSON
     programsChanged = pyqtSignal(str)  # running audio programs as JSON
+    programsSupportedChanged = pyqtSignal(bool)  # per-app capture available on this OS
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
     monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
     updateAvailable = pyqtSignal(str, str)  # (latest_version, release_page_url)
@@ -1158,6 +1174,7 @@ class AudioRadarApp(QMainWindow):
         self.selected_monitor = 0
         self._selected_monitor_name = None
         self.selected_program = None  # None = whole-system audio; else a program name
+        self._program_capability: bool | None = None  # per-app support; probed by the list thread, GUI reads only
         fresh_install = not os.path.exists(PROFILES_FILE) and not os.path.exists(SETTINGS_FILE)
         self.profiles = self._load_profiles()
         self.settings = self._load_settings()
@@ -1937,11 +1954,23 @@ class AudioRadarApp(QMainWindow):
             # isRunning() can already be false before that callback is delivered.
             logger.debug("program list refresh skipped: previous request pending")
             return
+        if self._program_capability is False:
+            # Unsupported OS (probed by the list thread, never on the GUI
+            # thread - importing process_loopback would initialize comtypes
+            # COM on Qt's STA main thread): re-announce the gate so the
+            # dropdown cannot re-enable; skip the doomed enumeration.
+            self.bridge.programsSupportedChanged.emit(False)
+            return
         logger.debug("program list refresh started")
         self._program_list_thread = ProgramListThread(self)
         self._program_list_thread.result.connect(self.bridge.programsChanged)
+        self._program_list_thread.capability.connect(self._on_program_capability)
         self._program_list_thread.finished.connect(self._on_program_list_finished)
         self._program_list_thread.start()
+
+    def _on_program_capability(self, supported):
+        self._program_capability = supported
+        self.bridge.programsSupportedChanged.emit(supported)
 
     def _on_program_list_finished(self):
         sender = self.sender()
@@ -2102,14 +2131,21 @@ class AudioRadarApp(QMainWindow):
         webbrowser.open("https://vb-audio.com/Cable/")
 
     def _resolve_target(self):
-        """Map the selected program name to a live PID. Returns (pid, name) or
-        (None, None) for whole-system capture / if the program is gone."""
+        """Map the selected program name to a live PID via the process table.
+
+        Returns (pid, name) when the program is running, or (None, None) for
+        whole-system capture. Dropdown names are process image names without
+        the .exe suffix, so the process table alone resolves every entry - an
+        audio session is not required (the program may start playing after the
+        radar starts). Session enumeration stays off the GUI thread: it needs
+        comtypes, which must not be first imported on Qt's STA main thread."""
         if not self.selected_program:
             return None, None
+        pid = None
         try:
-            from process_loopback import resolve_pid
+            from process_loopback import find_process_pid
 
-            pid = resolve_pid(self.selected_program)
+            pid = find_process_pid(self.selected_program)
         except Exception as exc:  # noqa: BLE001 - target process may disappear.
             logger.warning(
                 "program target resolution failed name=%s: %s",
@@ -2269,10 +2305,26 @@ class AudioRadarApp(QMainWindow):
                 self._active_capture_generation,
             )
             return False
+        if self.selected_program and self._program_capability is False:
+            # Single authoritative per-app gate: never fall back to
+            # whole-system capture when the OS cannot capture per-app
+            # (capability is probed by the list thread, see emit_programs).
+            logger.warning(
+                "per-app capture unsupported: refusing per-program target %r",
+                self.selected_program,
+            )
+            self._capture_terminal_error = "Per-app capture requires Windows 11 - switch to All (system audio)"
+            return False
         # Resolve the capture target fresh (PIDs change between launches).
         pid, name = self._resolve_target()
+        if self.selected_program and pid is None:
+            self._capture_terminal_error = (
+                f"No process found for {self.selected_program} - is it still running? "
+                "Switch to All (system audio) or try again."
+            )
+            return False
         self.audio_thread.set_target(pid, name)
-        self._capture_label = name if pid is not None else (self.selected_program or "system audio")
+        self._capture_label = name or "system audio"
         self.audio_thread.set_mono(self.mono_enabled, self.mono_device)
         self._apply_audio_settings_to_thread()
         self.audio_thread.clear_latest_audio()
@@ -2400,12 +2452,15 @@ class AudioRadarApp(QMainWindow):
             self._watchdog_generation = self._active_capture_generation
             self._capture_watchdog.start()
             return
-        self._capture_terminal_error = "Unable to start audio capture"
+        if self._capture_terminal_error is None:
+            # Only the generic message when nothing more specific was set -
+            # a B1/B2 rejection above already carries its own reason.
+            self._capture_terminal_error = "Unable to start audio capture"
         self._stop_audio_consumption()
         self.overlay.hide()
         self._set_operation_state("idle")
         self.bridge.statusChanged.emit(self._capture_terminal_error, False)
-        logger.error("radar start failed: unable to start capture thread")
+        logger.error("radar start failed: %s", self._capture_terminal_error)
         self._capture_terminal_error = None
 
     def start_radar(self):

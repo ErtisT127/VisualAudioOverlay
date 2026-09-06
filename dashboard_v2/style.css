@@ -575,6 +575,16 @@ body::before {
   display: block;
   text-align: left;
 }
+/* Gated field (per-app capture on an unsupported OS): dimmed, no hover
+   feedback, cursor says no - the trigger stays focusable so its title
+   tooltip remains reachable. */
+.live-select.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.live-select.is-disabled:hover {
+  background-color: var(--card);
+}
 .live-select:focus-visible {
   outline: 2px solid rgba(0, 157, 255, 0.55);
   outline-offset: 1px;

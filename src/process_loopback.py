@@ -8,8 +8,10 @@ processes) instead, so the radar only reacts to the game you picked.
 
 It is Windows-only and needs Windows 10 build 20348 / Windows 11 or newer, the
 first releases that expose `ActivateAudioInterfaceAsync` with
-`AUDIOCLIENT_ACTIVATION_PARAMS`. On anything older (or if activation fails) the
-caller is expected to fall back to whole-system capture.
+`AUDIOCLIENT_ACTIVATION_PARAMS`. On anything older, per-app capture is
+unsupported: the dashboard disables the program dropdown and whole-system
+capture is only ever chosen explicitly by the user - never silently. If
+activation still fails at capture time, that is an error, not a fallback.
 
 Design notes
 ------------
@@ -20,6 +22,12 @@ Design notes
   is ready, so `read()` blocks on that event instead of busy-spinning.
 * Output matches what soundcard gives us - a float32 numpy array shaped
   (frames, channels) - so audio_capture.py's direction math is unchanged.
+* Importing this module runs comtypes, which initializes COM as MTA (see the
+  coinit_flags comment at the top). The Qt GUI thread is STA, so a first import
+  there raises RPC_E_CHANGED_MODE. First imports must therefore happen on a Qt
+  worker thread (ProgramListThread) or in a capture worker process; the GUI
+  thread only reads the capability result and calls the pure-ctypes helpers
+  below (is_supported, find_process_pid, is_process_alive).
 """
 
 import sys
@@ -71,6 +79,10 @@ class WAVEFORMATEX(ctypes.Structure):
 AUDCLNT_SHAREMODE_SHARED = 0
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000
+# Ask the engine to convert the endpoint mix to our requested format instead of
+# failing on a non-48k default endpoint - the same pair soundcard passes.
+AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = 0x80000000
+AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
 AUDCLNT_BUFFERFLAGS_SILENT = 0x2
 
 WAVE_FORMAT_IEEE_FLOAT = 0x0003
@@ -101,6 +113,38 @@ _kernel32.WaitForSingleObject.restype = wintypes.DWORD
 _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 _kernel32.CloseHandle.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+# ── Process snapshot (CreateToolhelp32Snapshot) for PID lookup/alive checks ──
+TH32CS_SNAPPROCESS = 0x2
+STILL_ACTIVE = 259
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_kernel32.Process32FirstW.restype = wintypes.BOOL
+_kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+_kernel32.Process32NextW.restype = wintypes.BOOL
+_kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 
 # comtypes' CoInitializeEx forces an STA apartment, but ActivateAudioInterfaceAsync
 # requires MTA - so we initialize COM ourselves via raw ole32.
@@ -345,7 +389,10 @@ class ProcessLoopbackCapture:
         wfx_ptr = ctypes.cast(ctypes.byref(wfx), POINTER(_PycawWAVEFORMATEX))
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
             0,
             0,
             wfx_ptr,
@@ -549,9 +596,47 @@ def list_audio_programs() -> list[dict]:
     return [{"name": k, "pid": v} for k, v in sorted(found.items(), key=lambda kv: kv[0].lower())]
 
 
-def resolve_pid(program_name: str) -> int | None:
-    """Look up the current PID for a program name from live audio sessions."""
-    for p in list_audio_programs():
-        if p["name"].lower() == program_name.lower():
-            return p["pid"]
+def find_process_pid(process_name: str) -> int | None:
+    """Find the PID of a running process by image name (case-insensitive,
+    tolerating a missing `.exe`). None when it is not running or the snapshot
+    fails.
+
+    This is the primary target resolver. Dropdown names round-trip to image
+    names (list_audio_programs strips the .exe; this re-appends it), so the
+    process table alone resolves every entry - an audio session is not
+    required. Pure ctypes, safe on the Qt GUI thread, unlike the session
+    enumeration above which needs comtypes COM."""
+    if not process_name:
+        return None
+    if not process_name:
+        return None
+    image = process_name.lower()
+    if not image.endswith(".exe"):
+        image += ".exe"
+    snapshot = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        found = _kernel32.Process32FirstW(snapshot, byref(entry))
+        while found:
+            if entry.szExeFile.lower() == image:
+                return int(entry.th32ProcessID)
+            found = _kernel32.Process32NextW(snapshot, byref(entry))
+    finally:
+        _kernel32.CloseHandle(snapshot)
     return None
+
+
+def is_process_alive(pid: int) -> bool:
+    """True while a process with `pid` exists. A failed handle or a collected
+    exit code counts as dead - callers stop capture when this goes False."""
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not _kernel32.GetExitCodeProcess(handle, byref(exit_code)):
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        _kernel32.CloseHandle(handle)

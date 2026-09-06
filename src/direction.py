@@ -89,3 +89,41 @@ def angle_diff(a, b):
     for a sound directly behind the player (surround mode) split into two.
     """
     return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+# Content floor for the surround probe (~-80 dBFS). Loopback silence is
+# bit-exact 0.0, so anything above this on a channel is real signal.
+SURROUND_CONTENT_FLOOR = 0.0001
+
+
+def detect_surround_mode(levels, channel_count, floor=SURROUND_CONTENT_FLOOR):
+    """Classify one capture block for the surround-mode decision.
+
+    `levels` holds one peak (max abs) per channel; only the first
+    `channel_count` entries count. Returns False for a stereo device (<6ch)
+    or when audible content sits only in FL/FR; True when any speaker beyond
+    FL/FR carries signal; None while the block is silent. The caller locks in
+    the first non-None verdict - silence must never decide the mode, because
+    a muted 7.1 device would otherwise be stuck in stereo once audio starts.
+    """
+    levels = np.asarray(levels, dtype=np.float64).ravel()
+    if channel_count < 6:
+        return False
+    probed = levels[: min(levels.size, channel_count)]
+    rear = levels[2:channel_count]
+    if rear.size == 0:
+        return False
+    if float(np.max(probed)) <= floor:
+        return None
+    return float(np.max(rear)) > floor
+
+
+def fold_surround(rms):
+    """Reduce a >=6-channel per-speaker level row to the five radar levels
+    (fl, fr, c, rl, rr): 5.1 maps directly, and 7.1's side channels fold into
+    the rear pair. LFE never participates."""
+    fl, fr, c, rl, rr = rms[0], rms[1], rms[2], rms[4], rms[5]
+    if len(rms) >= 8:
+        rl = rl + rms[6]
+        rr = rr + rms[7]
+    return fl, fr, c, rl, rr

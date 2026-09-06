@@ -7,7 +7,7 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from app_logging import LOG_DEBUG_ENV, get_logger
-from direction import band_rms, stereo_angle, surround_angle
+from direction import band_rms, detect_surround_mode, fold_surround, stereo_angle, surround_angle
 
 logger = get_logger("audio_capture")
 
@@ -306,7 +306,7 @@ class AudioCaptureThread(QThread):
     def _run_process_loopback(self):
         """Capture only the selected program; never fall back to system audio."""
         try:
-            from process_loopback import ProcessLoopbackCapture
+            from process_loopback import ProcessLoopbackCapture, is_process_alive
         except Exception as e:  # noqa: BLE001 - optional process loopback may be unavailable.
             message = self._user_failure_message()
             logger.error("Process loopback unavailable: %s", e)
@@ -325,6 +325,7 @@ class AudioCaptureThread(QThread):
         label = self.target_name or f"PID {self.target_pid}"
         logger.info("Capturing app audio: %s (per-app, Stereo L/R)", label)
         self.device_info_signal.emit(f"{label} (per-app)", 2)
+        reads = 0
         try:
             first_data = cap.read(AUDIO_BLOCK_FRAMES)
             self.ready_signal.emit()
@@ -334,6 +335,16 @@ class AudioCaptureThread(QThread):
                 data = cap.read(AUDIO_BLOCK_FRAMES)
                 self._feed_mono(data)
                 self._process_chunk(data, use_surround=False)
+                reads += 1
+                # The stream gives no error of its own when the target exits;
+                # its session just goes silent. Prove liveness ~every 0.5s
+                # (each read waits up to ~50ms) and stop with a clear reason.
+                if reads % 10 == 0 and self.running and not is_process_alive(self.target_pid):
+                    logger.info("capture target exited mid-run pid=%s", self.target_pid)
+                    self.error_signal.emit(
+                        f"{label} exited - capture stopped. Pick a running program or All (system audio)."
+                    )
+                    break
         except Exception:
             logger.exception("Process loopback capture error")
             if self.running:
@@ -392,27 +403,39 @@ class AudioCaptureThread(QThread):
                 first_data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
                 raw_channels = first_data.shape[1]
 
+                # Surround mode locks in on the first block with real content;
+                # silence never decides, so a muted 7.1 device keeps the verdict
+                # (and the single device_info reporting it) pending until audio
+                # arrives. <6ch devices are stereo outright and report at once.
                 use_surround = False
-                if raw_channels >= 6:
-                    surround_max = max(
-                        float(np.max(np.abs(first_data[:, ch]))) for ch in range(2, min(raw_channels, 6))
-                    )
-                    if surround_max > 0.0001:
-                        use_surround = True
+                effective = min(raw_channels, 2)
+                mode = "Stereo L/R"
+                unsettled = raw_channels >= 6
+                if not unsettled:
+                    logger.info("Channels: %s | Mode: %s", raw_channels, mode)
+                    self.device_info_signal.emit(device.name, effective)
 
-                effective = raw_channels if use_surround else min(raw_channels, 2)
-                mode = "360° Surround" if use_surround else "Stereo L/R"
-                logger.info("Channels: %s | Mode: %s", raw_channels, mode)
-                self.device_info_signal.emit(device.name, effective)
                 self.ready_signal.emit()
 
-                self._feed_mono(first_data)
-                self._process_chunk(first_data, use_surround)
-
+                data = first_data
                 while self.running:
-                    data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
                     self._feed_mono(data)
-                    self._process_chunk(data, use_surround)
+                    if unsettled:
+                        # Probing needs per-block peak levels only while the
+                        # verdict is open; afterwards the mode is locked.
+                        verdict = detect_surround_mode(np.max(np.abs(data), axis=0), raw_channels)
+                        if verdict is not None:
+                            unsettled = False
+                            if verdict:
+                                use_surround = True
+                                effective = raw_channels
+                                mode = "360° Surround"
+                            logger.info("Channels: %s | Mode: %s", raw_channels, mode)
+                            self.device_info_signal.emit(device.name, effective)
+                    if not unsettled:
+                        self._process_chunk(data, use_surround)
+                    if self.running:
+                        data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
 
         except Exception:
             logger.exception("Device '%s' failed", device.name)
@@ -433,8 +456,9 @@ class AudioCaptureThread(QThread):
         angle_deg = 0.0
 
         if use_surround and data.shape[1] >= 6:
-            fl, fr, c = float(rms[0]), float(rms[1]), float(rms[2])
-            rl, rr = float(rms[4]), float(rms[5])
+            # 5.1 maps directly onto the radar levels; 7.1's side channels
+            # fold into the rear pair (A2). LFE is never a radar level.
+            fl, fr, c, rl, rr = fold_surround(rms)
             intensity = max(fl, fr, c, rl, rr)
             if intensity > self.sensitivity and intensity < self.max_amplitude:
                 angle_deg = surround_angle(fl, fr, c, rl, rr)
