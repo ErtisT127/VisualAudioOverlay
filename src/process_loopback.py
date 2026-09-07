@@ -75,6 +75,27 @@ class WAVEFORMATEX(ctypes.Structure):
     ]
 
 
+class WAVEFORMATEXTENSIBLE(ctypes.Structure):
+    """Layout-correct WAVEFORMATEXTENSIBLE (40 bytes). The leading 18 bytes are
+    the WAVEFORMATEX header; the rest carries the channel mask and subformat
+    that WASAPI needs to describe a multichannel wire. Passed to Initialize as
+    a WAVEFORMATEX pointer - the callee only reads what cbSize promises."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("wFormatTag", wintypes.WORD),
+        ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD),
+        ("nAvgBytesPerSec", wintypes.DWORD),
+        ("nBlockAlign", wintypes.WORD),
+        ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
+        ("wValidBitsPerSample", wintypes.WORD),
+        ("dwChannelMask", wintypes.DWORD),
+        ("SubFormat", wintypes.BYTE * 16),
+    ]
+
+
 # ── Constants ──────────────────────────────────────────────────────────────
 AUDCLNT_SHAREMODE_SHARED = 0
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
@@ -86,7 +107,12 @@ AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
 AUDCLNT_BUFFERFLAGS_SILENT = 0x2
 
 WAVE_FORMAT_IEEE_FLOAT = 0x0003
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 VT_BLOB = 0x41  # 65
+
+# KSDATAFORMAT_SUBTYPE_IEEE_FLOAT as raw bytes, for WAVEFORMATEXTENSIBLE
+# requests built from a mix format whose own subformat could not be read.
+IEEE_FLOAT_SUBFORMAT = bytes.fromhex("0300000000001000800000aa00389b71")
 
 COINIT_MULTITHREADED = 0x0
 
@@ -313,6 +339,8 @@ class ProcessLoopbackCapture:
     def __init__(self, pid: int, samplerate: int = 48000, channels: int = 2):
         self.pid = int(pid)
         self.samplerate = samplerate
+        # Fallback only: start() overwrites this with the endpoint's real mix
+        # format channel count when the GetMixFormat probe succeeds.
         self.channels = channels
         self._client = None
         self._capture = None
@@ -330,7 +358,8 @@ class ProcessLoopbackCapture:
 
         try:
             self._client = self._activate_client()
-            self._init_stream(self._client)
+            spec = self._resolve_mix_spec(self._client)
+            self._init_stream(self._client, spec)
             self._client.Start()
             self._started = True
         except Exception as e:
@@ -372,21 +401,95 @@ class ProcessLoopbackCapture:
             raise RuntimeError(f"GetActivateResult HRESULT 0x{activate_hr & 0xFFFFFFFF:08X}")
         return unknown.QueryInterface(IAudioClient)
 
-    def _init_stream(self, client: IAudioClient):
+    def _resolve_mix_spec(self, client: IAudioClient):
+        """Read the wire's real channel layout from the endpoint's shared-mode
+        mix format, so a multichannel wire (e.g. 7.1 routed to VB-CABLE) is
+        captured with all of its channels instead of a hard-coded stereo pair.
+        Returns a {"channels", "mask", "subformat"} spec, or None when nothing
+        can be resolved - the caller then falls back to stereo. A failed probe
+        must never break capture.
+
+        The process-loopback virtual client answers GetMixFormat with
+        E_NOTIMPL, so the spec normally comes from the render endpoint the
+        target's audio session actually plays to (same format the engine
+        mixes into)."""
+        pwfx = None
+        try:
+            pwfx = client.GetMixFormat()
+            spec = _spec_from_wave_format(pwfx)
+            logger.info("mix format reports %d channel(s) for pid=%s", spec["channels"], self.pid)
+            return spec
+        except Exception as exc:  # noqa: BLE001 - the probe must never break capture.
+            spec = _session_endpoint_mix_spec(self.pid)
+            if spec is not None:
+                logger.info("endpoint mix format reports %d channel(s) for pid=%s", spec["channels"], self.pid)
+                return spec
+            logger.warning("mix format query failed; keeping %d channel(s): %s", self.channels, exc)
+            return None
+        finally:
+            # GetMixFormat allocates with CoTaskMemAlloc and comtypes does not
+            # manage the buffer - free it ourselves after reading.
+            if pwfx:
+                _ole32.CoTaskMemFree(pwfx)
+
+    def _init_stream(self, client: IAudioClient, spec):
+        """Open the capture stream. A multichannel wire needs a
+        WAVEFORMATEXTENSIBLE request - the process-loopback client rejects
+        plain-header (18-byte WAVEFORMATEX) requests above 2 channels with
+        E_INVALIDARG - so when the spec says >2ch, replay the endpoint's own
+        extensible fields (channel mask, subformat) at float32/our samplerate
+        with AUTOCONVERTPCM doing any conversion. If the engine still refuses
+        (some endpoints only offer stereo), retry the original plain stereo
+        request so capture always opens. `self.channels` ends up as the real
+        captured channel count either way."""
+        if spec is not None and spec["channels"] > 2:
+            try:
+                self._open_stream(client, spec["channels"], spec)
+                self.channels = spec["channels"]
+                logger.info("capturing %d-channel wire (extensible format)", spec["channels"])
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back rather than break capture.
+                if self._event:
+                    _kernel32.CloseHandle(self._event)
+                    self._event = None
+                logger.warning("multichannel request refused (%s); retrying stereo", exc)
+        self._open_stream(client, 2, None)
+        self.channels = 2
+
+    def _open_stream(self, client: IAudioClient, channels, ext):
+        """One Initialize attempt: `ext` None -> plain float32 WAVEFORMATEX
+        (stereo fallback, the original behaviour); `ext` a mix spec -> a
+        WAVEFORMATEXTENSIBLE float32 request with the wire's own channel mask
+        and subformat. Raises on failure."""
         wfx = WAVEFORMATEX()
         wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT
-        wfx.nChannels = self.channels
+        wfx.nChannels = channels
         wfx.nSamplesPerSec = self.samplerate
         wfx.wBitsPerSample = 32
-        wfx.nBlockAlign = self.channels * 4
+        wfx.nBlockAlign = channels * 4
         wfx.nAvgBytesPerSec = self.samplerate * wfx.nBlockAlign
         wfx.cbSize = 0
         self._block_align = wfx.nBlockAlign
 
+        wfx_ptr = ctypes.cast(ctypes.byref(wfx), POINTER(_PycawWAVEFORMATEX))
+        if ext is not None:
+            extensible = WAVEFORMATEXTENSIBLE()
+            extensible.wFormatTag = WAVE_FORMAT_EXTENSIBLE
+            extensible.nChannels = channels
+            extensible.nSamplesPerSec = self.samplerate
+            extensible.wBitsPerSample = 32
+            extensible.nBlockAlign = channels * 4
+            extensible.nAvgBytesPerSec = self.samplerate * extensible.nBlockAlign
+            extensible.cbSize = ctypes.sizeof(WAVEFORMATEXTENSIBLE) - ctypes.sizeof(WAVEFORMATEX)
+            extensible.wValidBitsPerSample = 32
+            extensible.dwChannelMask = ext["mask"]
+            extensible.SubFormat = (wintypes.BYTE * 16).from_buffer_copy(ext["subformat"] or IEEE_FLOAT_SUBFORMAT)
+            self._block_align = extensible.nBlockAlign
+            wfx_ptr = ctypes.cast(ctypes.byref(extensible), POINTER(_PycawWAVEFORMATEX))
+
         # Event-driven shared mode: both durations MUST be 0. The Initialize
         # COMMETHOD expects pycaw's WAVEFORMATEX pointer type, so cast our
         # (correctly sized) struct to it.
-        wfx_ptr = ctypes.cast(ctypes.byref(wfx), POINTER(_PycawWAVEFORMATEX))
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK
@@ -501,6 +604,83 @@ class ProcessLoopbackCapture:
             except Exception as exc:  # noqa: BLE001 - COM cleanup must not mask shutdown.
                 logger.debug("COM uninitialization failed: %s", exc)
             self._com_inited = False
+
+
+# ── Mix-format resolution for process-loopback capture ─────────────────────
+def _spec_from_wave_format(pwfx) -> dict:
+    """Extract a {"channels", "mask", "subformat"} spec from a GetMixFormat
+    buffer. The channel count lives at byte offset 2 of the WAVEFORMATEX
+    header; channel mask and subformat only exist on extensible formats
+    (cbSize >= 22, starting at bytes 20 and 24 of the buffer)."""
+    wfx = pwfx.contents
+    mask, subformat = 0, None
+    if wfx.cbSize >= 22:
+        base = ctypes.addressof(wfx)
+        mask = int(ctypes.cast(base + 20, POINTER(wintypes.DWORD))[0])
+        subformat = bytes((wintypes.BYTE * 16).from_address(base + 24))
+    return {"channels": int(wfx.nChannels), "mask": mask, "subformat": subformat}
+
+
+def _endpoint_mix_spec(dev):
+    """Mix-format spec of a render endpoint, read off an IAudioClient
+    activated on the endpoint itself. None on failure."""
+    import comtypes
+
+    pwfx = None
+    try:
+        client = dev.Activate(IAudioClient._iid_, comtypes.CLSCTX_ALL, None).QueryInterface(IAudioClient)
+        pwfx = client.GetMixFormat()
+        return _spec_from_wave_format(pwfx)
+    except Exception as exc:  # noqa: BLE001 - endpoint probing is best effort.
+        logger.warning("endpoint mix format query failed: %s", exc)
+        return None
+    finally:
+        if pwfx:
+            _ole32.CoTaskMemFree(pwfx)
+
+
+def _session_endpoint_mix_spec(pid: int):
+    """Mix-format spec of the render endpoint that the target process's audio
+    session plays to. None when no session matches.
+
+    The process-loopback virtual client cannot answer GetMixFormat itself, but
+    the endpoint it renders to can - so find that endpoint by session and ask
+    it directly. Mirrors the scan in _sessions_all_render_devices; first match
+    wins when a process holds sessions on several endpoints."""
+    import comtypes
+    from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
+    from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+    from pycaw.constants import DEVICE_STATE, CLSID_MMDeviceEnumerator, EDataFlow
+
+    enumerator = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER)
+    devices = enumerator.EnumAudioEndpoints(EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
+
+    for i in range(devices.GetCount()):
+        dev = devices.Item(i)
+        if dev is None:
+            continue
+        try:
+            mgr = dev.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None).QueryInterface(
+                IAudioSessionManager2
+            )
+            session_enum = mgr.GetSessionEnumerator()
+        except Exception:  # noqa: BLE001 - endpoint enumeration is best effort.
+            continue  # some endpoints refuse a session manager - skip them
+        for j in range(session_enum.GetCount()):
+            ctl = session_enum.GetSession(j)
+            if ctl is None:
+                continue
+            try:
+                ctl2 = ctl.QueryInterface(IAudioSessionControl2)
+                session_pid = int(ctl2.GetProcessId())
+            except Exception:  # noqa: BLE001 - session metadata is optional.
+                continue
+            if session_pid != int(pid):
+                continue
+            spec = _endpoint_mix_spec(dev)
+            if spec is not None:
+                return spec
+    return None
 
 
 # ── Program enumeration ────────────────────────────────────────────────────

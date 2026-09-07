@@ -61,7 +61,23 @@
               <span>Audio Device</span>
             </div>
             <div id="device-name" class="device-name">No device detected</div>
-            <div id="device-channels" class="device-sub"></div>
+            <!-- Channel count + live mapping ("6ch · Surround 360°"). The arrow
+                 button right of it flips the mapping on >=6ch wires: session-only,
+                 hidden until the radar runs on a multichannel device. No on/off
+                 state of its own - the label text says which mapping is live. -->
+            <div class="device-sub device-line">
+              <span id="device-channels"></span>
+              <button
+                type="button"
+                id="mapping-toggle"
+                class="mapping-toggle is-hidden"
+                title="Switch between Surround 360° and Stereo L/R mapping"
+                aria-label="Switch between Surround 360° and Stereo L/R mapping"
+                onclick="AR.toggleMapping()"
+              >
+                <img src="icons/ArrowLeftRight.svg" class="icon" alt="" />
+              </button>
+            </div>
           </div>
 
           <!-- Mono Output (single-sided listeners). The overlay shows the

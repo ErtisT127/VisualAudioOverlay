@@ -4,7 +4,7 @@ Visual Audio Overlay uses the following third-party components.
 
 ## Lucide Icons
 
-The Save and Rotate_Ccw interface icons are adapted from Lucide.
+The Save, Rotate_Ccw, and ArrowLeftRight interface icons are adapted from Lucide.
 
 - Origin: https://lucide.dev/
 - License: ISC

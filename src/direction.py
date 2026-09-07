@@ -74,12 +74,78 @@ def stereo_angle(left_rms, right_rms):
     return sign * (abs(balance) ** 0.3) * 90.0
 
 
-def surround_angle(fl, fr, c, rl, rr):
-    """5.1 channel levels -> angle in degrees, 0 = front, +90 = right,
-    +-180 = rear."""
-    x = (fr + rr) - (fl + rl)
-    y = (fl + fr + c) - (rl + rr)
-    return math.degrees(math.atan2(x, y))
+# Azimuths in degrees, 0 = front, + = right (compass-clockwise), as
+# (channel_index, azimuth) pairs in WAVE order (FL FR FC LFE BL BR [SL SR]).
+# LFE (index 3) is excluded structurally - it has no entry.
+_LAYOUT_5_1 = ((0, -30.0), (1, 30.0), (2, 0.0), (4, -110.0), (5, 110.0))
+_LAYOUT_7_1 = ((0, -30.0), (1, 30.0), (2, 0.0), (4, -135.0), (5, 135.0), (6, -90.0), (7, 90.0))
+
+
+def _layout_for(channel_count):
+    """6 -> 5.1 table; >=8 -> 7.1 table applied to the first 8 columns (a
+    16ch 7.1+height wire keeps its base ring; a 5.1.2 wire's 8th column is a
+    height speaker, not a side - accepted, never exercised). 7ch (never
+    observed) falls to the 5.1 table; <6ch is the caller's stereo path."""
+    return _LAYOUT_7_1 if channel_count >= 8 else _LAYOUT_5_1
+
+
+def surround_angle(levels, channel_count):
+    """Weighted speaker azimuths -> angle in degrees, 0 = front, + = right.
+    atan2(sum(L_i * sin a_i), sum(L_i * cos a_i)) over the layout's non-LFE
+    columns. Single-speaker tones land exactly on that speaker's azimuth;
+    equal L/R pairs land front; an equal rear pair lands +-180. An exact zero
+    vector returns 0.0 - the caller's gate suppresses silent blocks first.
+    (A perfectly balanced side pair on 7.1 is a directionless phantom and
+    reads front here; libm's sin antisymmetry makes it deterministic.)"""
+    sx = sy = 0.0
+    for i, az in _layout_for(channel_count):
+        if i >= len(levels):
+            break
+        w = float(levels[i])
+        if w == 0.0:
+            continue
+        r = math.radians(az)
+        sx += w * math.sin(r)
+        sy += w * math.cos(r)
+    return math.degrees(math.atan2(sx, sy))
+
+
+def surround_intensity(levels, channel_count):
+    """Loudest participating (non-LFE) level of the wire's layout."""
+    return max(
+        (float(levels[i]) for i, _ in _layout_for(channel_count) if i < len(levels)),
+        default=0.0,
+    )
+
+
+# ITU BS.775-style coefficient for folding a multichannel mix into stereo:
+# every non-front speaker enters at 1/sqrt(2), preserving total energy.
+DOWNMIX_Q = 1.0 / math.sqrt(2.0)
+
+
+def stereo_downmix(levels, channel_count):
+    """Fold a >=6-channel wire down to the L/R pair a stereo mix of the same
+    programme would carry, so nothing that is audible in surround mode
+    disappears in stereo mode. FL/FR pass through unchanged; centre and each
+    rear/side speaker contribute at DOWNMIX_Q - centre split across both
+    sides, left-azimuth speakers (BL/SL) into the left and right-azimuth
+    (BR/SR) into the right. LFE never participates and columns beyond the
+    wire's layout are ignored, mirroring surround_angle."""
+    levels = np.asarray(levels, dtype=np.float64).ravel()
+    left = float(levels[0]) if levels.size else 0.0
+    right = float(levels[1]) if levels.size > 1 else 0.0
+    for i, azimuth in _layout_for(channel_count):
+        if i < 2 or i >= levels.size:  # FL/FR already counted as pass-through
+            continue
+        w = DOWNMIX_Q * float(levels[i])
+        if azimuth == 0.0:  # centre -> both sides
+            left += w
+            right += w
+        elif azimuth < 0.0:  # rear/side-left -> left
+            left += w
+        else:  # rear/side-right -> right
+            right += w
+    return left, right
 
 
 def angle_diff(a, b):
@@ -89,41 +155,3 @@ def angle_diff(a, b):
     for a sound directly behind the player (surround mode) split into two.
     """
     return abs((a - b + 180.0) % 360.0 - 180.0)
-
-
-# Content floor for the surround probe (~-80 dBFS). Loopback silence is
-# bit-exact 0.0, so anything above this on a channel is real signal.
-SURROUND_CONTENT_FLOOR = 0.0001
-
-
-def detect_surround_mode(levels, channel_count, floor=SURROUND_CONTENT_FLOOR):
-    """Classify one capture block for the surround-mode decision.
-
-    `levels` holds one peak (max abs) per channel; only the first
-    `channel_count` entries count. Returns False for a stereo device (<6ch)
-    or when audible content sits only in FL/FR; True when any speaker beyond
-    FL/FR carries signal; None while the block is silent. The caller locks in
-    the first non-None verdict - silence must never decide the mode, because
-    a muted 7.1 device would otherwise be stuck in stereo once audio starts.
-    """
-    levels = np.asarray(levels, dtype=np.float64).ravel()
-    if channel_count < 6:
-        return False
-    probed = levels[: min(levels.size, channel_count)]
-    rear = levels[2:channel_count]
-    if rear.size == 0:
-        return False
-    if float(np.max(probed)) <= floor:
-        return None
-    return float(np.max(rear)) > floor
-
-
-def fold_surround(rms):
-    """Reduce a >=6-channel per-speaker level row to the five radar levels
-    (fl, fr, c, rl, rr): 5.1 maps directly, and 7.1's side channels fold into
-    the rear pair. LFE never participates."""
-    fl, fr, c, rl, rr = rms[0], rms[1], rms[2], rms[4], rms[5]
-    if len(rms) >= 8:
-        rl = rl + rms[6]
-        rr = rr + rms[7]
-    return fl, fr, c, rl, rr

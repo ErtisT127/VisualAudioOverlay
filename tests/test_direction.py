@@ -10,13 +10,12 @@ import numpy as np
 import pytest
 
 from direction import (
-    SURROUND_CONTENT_FLOOR,
     angle_diff,
     band_rms,
-    detect_surround_mode,
-    fold_surround,
     stereo_angle,
+    stereo_downmix,
     surround_angle,
+    surround_intensity,
 )
 
 SR = 48000
@@ -104,95 +103,138 @@ def test_silent_stereo_stays_centered():
     assert stereo_angle(0.0, 0.0) == pytest.approx(0.0)
 
 
-# ── surround_angle ─────────────────────────────────────────────────────
+# ── surround_angle / surround_intensity (per-layout speaker azimuths) ───
 
 
-def test_surround_front_is_zero():
-    assert surround_angle(1.0, 1.0, 1.0, 0.0, 0.0) == pytest.approx(0.0)
+def single_speaker(index, value, width):
+    levels = np.zeros(width)
+    levels[index] = value
+    return levels
 
 
-def test_surround_right_is_90():
-    assert surround_angle(0.0, 1.0, 0.0, 0.0, 1.0) == pytest.approx(90.0)
+def test_5_1_each_speaker_at_its_azimuth():
+    # 5.1: fronts at +-30, surrounds at +-110 (ITU-R BS.775). Single-tone
+    # placement is exact - no cancellation with only one active speaker.
+    for index, azimuth in ((0, -30.0), (1, 30.0), (2, 0.0), (4, -110.0), (5, 110.0)):
+        assert surround_angle(single_speaker(index, 1.0, 6), 6) == pytest.approx(azimuth, abs=1e-9)
 
 
-def test_surround_left_is_minus_90():
-    assert surround_angle(1.0, 0.0, 0.0, 1.0, 0.0) == pytest.approx(-90.0)
+def test_7_1_each_speaker_at_its_azimuth():
+    for index, azimuth in (
+        (0, -30.0),
+        (1, 30.0),
+        (2, 0.0),
+        (4, -135.0),
+        (5, 135.0),
+        (6, -90.0),
+        (7, 90.0),
+    ):
+        assert surround_angle(single_speaker(index, 1.0, 8), 8) == pytest.approx(azimuth, abs=1e-9)
 
 
-def test_surround_rear_is_180():
-    assert abs(surround_angle(0.0, 0.0, 0.0, 1.0, 1.0)) == pytest.approx(180.0)
+def test_side_and_back_pairs_are_distinct_on_8ch():
+    # The core 7.1 fix: a side speaker keeps its own +-90 azimuth instead of
+    # folding into the back pair at +-135, so SL/BL and SR/BR no longer share
+    # one radar position.
+    assert surround_angle(single_speaker(7, 1.0, 8), 8) == pytest.approx(90.0, abs=1e-9)
+    assert surround_angle(single_speaker(5, 1.0, 8), 8) == pytest.approx(135.0, abs=1e-9)
 
 
-# ── detect_surround_mode ───────────────────────────────────────────────
+def test_equal_front_pair_is_front():
+    levels = np.array([0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
+    assert surround_angle(levels, 6) == pytest.approx(0.0, abs=1e-6)
 
 
-def test_detect_stereo_device_is_never_surround():
-    assert detect_surround_mode([0.0, 0.0], 2) is False
-    assert detect_surround_mode([0.5, 0.5], 4) is False  # <6ch ignores content
+def test_equal_rear_pair_is_directly_behind():
+    # 5.1 surrounds and 7.1 backs sit symmetric behind the player, so an equal
+    # pair reads straight back. Wrap-safe: +180 and -180 draw identically.
+    for levels, count in (
+        (np.array([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]), 6),
+        (np.array([0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0]), 8),
+    ):
+        angle = surround_angle(levels, count)
+        assert abs(abs(angle) - 180.0) < 1e-6
 
 
-def test_detect_silent_blocks_keep_waiting():
-    assert detect_surround_mode([0.0] * 6, 6) is None
-    # Exactly at the floor is still silence, not a decision.
-    assert detect_surround_mode([SURROUND_CONTENT_FLOOR] * 6, 6) is None
+def test_lfe_is_excluded_from_angle_and_intensity():
+    for count in (6, 8):
+        levels = single_speaker(3, 1.0, count)
+        assert surround_angle(levels, count) == pytest.approx(0.0)
+        assert surround_intensity(levels, count) == pytest.approx(0.0)
 
 
-def test_detect_front_only_content_is_stereo():
-    levels = [0.5, 0.4, 0.0, 0.0, 0.0, 0.0]
-    assert detect_surround_mode(levels, 6) is False
+def test_all_silent_is_front():
+    levels = np.zeros(8)
+    assert surround_angle(levels, 8) == pytest.approx(0.0)
+    assert surround_intensity(levels, 8) == pytest.approx(0.0)
 
 
-def test_detect_any_rear_speaker_flips_surround():
-    assert detect_surround_mode([0.0, 0.0, 0.5, 0.0, 0.0, 0.0], 6) is True  # centre
-    assert detect_surround_mode([0.0, 0.0, 0.0, 0.0, 0.5, 0.0], 6) is True  # rear L
-    assert detect_surround_mode([0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 6) is True  # LFE
-    assert detect_surround_mode([0.0, 0.0, 0.0, 0.0, 0.0, 0.5], 6) is True  # rear R
+def test_intensity_is_max_of_participating():
+    # A loud LFE column must not leak into the radar level.
+    levels = np.array([0.1, 0.2, 0.3, 9.9, 0.7, 0.9])
+    assert surround_intensity(levels, 6) == pytest.approx(0.9)
+    assert surround_intensity(single_speaker(6, 0.8, 8), 8) == pytest.approx(0.8)
 
 
-def test_detect_eight_channel_side_speakers_flip_surround():
-    # 7.1: side channels at indices 6/7 are surround evidence too.
-    assert detect_surround_mode([0.0] * 6 + [0.5, 0.0], 8) is True
-    assert detect_surround_mode([0.0] * 6 + [0.0, 0.5], 8) is True
+def test_layout_is_chosen_by_channel_count_not_array_length():
+    # An 8-column frame read as a 5.1 wire: its side column (index 6) is not
+    # part of that layout, so it must not steer the angle or the level.
+    side = single_speaker(6, 1.0, 8)
+    assert surround_angle(side, 8) == pytest.approx(-90.0, abs=1e-9)
+    assert surround_angle(side, 6) == pytest.approx(0.0)
+    assert surround_intensity(side, 6) == pytest.approx(0.0)
+    # A >8ch wire (7.1 + height) only reads its base ring.
+    tall = single_speaker(12, 1.0, 16)
+    assert surround_angle(tall, 16) == pytest.approx(0.0)
+    assert surround_intensity(tall, 16) == pytest.approx(0.0)
 
 
-def test_detect_ignores_levels_beyond_channel_count():
-    # Levels may outlive the declared channel count (caller truncates); a
-    # probe that read 8 channels while the device has 6 must not see index 6.
-    levels = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.9, 0.9]
-    assert detect_surround_mode(levels, 6) is False
+def test_mixed_channels_blend_continuously_between_speakers():
+    # A source panned across real speakers sweeps the ring instead of hopping:
+    # equal FL+surround-L on 5.1 points halfway down the left wall...
+    left_wall = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    assert surround_angle(left_wall, 6) == pytest.approx(-70.0, abs=1e-9)
+    # ...FL biased toward C stays in the front-left quadrant...
+    front_biased = np.array([0.8, 0.0, 1.0, 0.0, 0.0, 0.0])
+    assert surround_angle(front_biased, 6) == pytest.approx(-13.294686193990028, abs=1e-9)
+    # ...and 7.1 content split between back-L and side-L lands between them.
+    side_dominant = np.array([0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.6, 0.0])
+    assert surround_angle(side_dominant, 8) == pytest.approx(-104.63880659517828, abs=1e-9)
 
 
-def test_detect_floor_is_configurable():
-    assert detect_surround_mode([0.0005] * 6, 6, floor=0.0001) is True
+# ── stereo_downmix (multichannel -> L/R fold) ──────────────────────────
 
 
-# ── fold_surround ──────────────────────────────────────────────────────
+def test_downmix_passes_front_through():
+    # FL/FR leave untouched; the L/R fold equals the original stereo pair.
+    assert stereo_downmix(np.array([0.2, 0.3, 0.0, 0.0, 0.0, 0.0]), 6) == pytest.approx((0.2, 0.3))
 
 
-def test_fold_six_channels_maps_directly():
-    fl, fr, c, rl, rr = fold_surround(np.array([0.5, 0.4, 0.3, 9.9, 0.2, 0.1]))
-    assert (fl, fr, c, rl, rr) == (0.5, 0.4, 0.3, 0.2, 0.1)
+def test_downmix_splits_centre_equally():
+    # Centre-only content reaches both sides at 1/sqrt(2), like the ITU fold.
+    q = 1.0 / math.sqrt(2.0)
+    assert stereo_downmix(np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]), 6) == pytest.approx((q, q))
 
 
-def test_fold_drops_lfe():
-    levels = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
-    assert tuple(fold_surround(levels)) == (0.0, 0.0, 0.0, 0.0, 0.0)
+def test_downmix_folds_each_rear_speaker_to_its_own_side():
+    # 5.1 surrounds and 7.1 backs/sides land on the L/R axis: BL/SL to the
+    # left, BR/SR to the right, each at 1/sqrt(2). Equal rears stay centred.
+    q = 1.0 / math.sqrt(2.0)
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]), 6) == pytest.approx((q, q))
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]), 6) == pytest.approx((q, 0.0))
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]), 6) == pytest.approx((0.0, q))
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]), 8) == pytest.approx((q, 0.0))
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]), 8) == pytest.approx((0.0, q))
 
 
-def test_fold_eight_channels_folds_sides_into_rear():
-    # 7.1: indices 6/7 (side L/R) add into rl/rr; LFE stays out.
-    levels = np.array([0.1, 0.2, 0.3, 9.9, 0.4, 0.5, 0.6, 0.7])
-    fl, fr, c, rl, rr = fold_surround(levels)
-    assert (fl, fr, c) == (0.1, 0.2, 0.3)
-    assert rl == 0.4 + 0.6
-    assert rr == 0.5 + 0.7
-
-
-def test_fold_side_only_content_reaches_the_rear_pair():
-    levels = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5])
-    fl, fr, c, rl, rr = fold_surround(levels)
-    assert (fl, fr, c) == (0.0, 0.0, 0.0)
-    assert (rl, rr) == (0.5, 0.5)
+def test_downmix_excludes_lfe_and_columns_beyond_the_layout():
+    # LFE never participates; a 6-column frame read as 7.1 stops at its own
+    # columns; a >8ch wire reads its base ring only (mirrors surround_angle).
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 9.0, 0.0, 0.0]), 6) == pytest.approx((0.0, 0.0))
+    assert stereo_downmix(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]), 6) == pytest.approx((0.0, 0.0))
+    tall = np.zeros(16)
+    tall[12] = 1.0
+    assert stereo_downmix(tall, 16) == pytest.approx((0.0, 0.0))
 
 
 # ── angle_diff ─────────────────────────────────────────────────────────

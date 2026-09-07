@@ -40,6 +40,11 @@ let hotkeyRequestBusy = false;
 const hotkeyPressed = new Set();
 let moveModeActive = false;
 let presetState = { id: "builtin:all-sounds", dirty: false };
+// Angle mapping (surround/stereo) for >=6ch wires: pushed from Python whenever
+// a capture opens or the user flips the toggle. Both start null/unknown, and
+// the toggle stays hidden until a >=6ch wire is actually being captured.
+let lastMappingChannels = null;
+let lastMappingMode = null;
 let presetApplying = false;
 let activeDashboardModal = null;
 let modalReturnFocus = null;
@@ -85,6 +90,7 @@ function initBridge() {
       if (bridge.programsSupportedChanged)
         bridge.programsSupportedChanged.connect(onProgramsSupportedChanged);
       if (bridge.monoStateChanged) bridge.monoStateChanged.connect(onMonoStateChanged);
+      if (bridge.mappingStateChanged) bridge.mappingStateChanged.connect(onMappingStateChanged);
       if (bridge.updateAvailable) bridge.updateAvailable.connect(onUpdateAvailable);
       if (bridge.appearanceChanged) bridge.appearanceChanged.connect(onAppearanceChanged);
       if (bridge.audioSettingsChanged) bridge.audioSettingsChanged.connect(onAudioSettingsChanged);
@@ -312,7 +318,9 @@ function clearPressedHotkeys() {
 }
 
 function onDeviceChanged(label) {
-  // label is "Name  (Nch)" - split the channel suffix onto its own line
+  // label is "Name  (Nch · Mapping)" - split the channel suffix onto its own
+  // line. The mapping label rides inside the same parentheses, so it shows up
+  // right of the channel count without a second formatting path.
   const m = label.match(/^(.*)\s+\(([^()]*)\)\s*$/);
   if (m) {
     setText("device-name", m[1].trim());
@@ -321,6 +329,28 @@ function onDeviceChanged(label) {
     setText("device-name", label);
     setText("device-channels", "");
   }
+}
+
+// Angle mapping state: the "Nch · Surround 360°" label next to the toggle is
+// the live readout. The toggle itself is a plain flip action - no on/off state
+// of its own - and only appears while the radar runs on a >=6ch wire.
+function onMappingStateChanged(jsonStr) {
+  try {
+    const s = JSON.parse(jsonStr) || {};
+    lastMappingChannels = typeof s.channels === "number" ? s.channels : null;
+    lastMappingMode = s.mode || null;
+  } catch (_) {
+    return;
+  }
+  updateMappingVisibility();
+}
+
+function updateMappingVisibility() {
+  const btn = document.getElementById("mapping-toggle");
+  if (!btn) return;
+  const usable =
+    operationState === "running" && lastMappingChannels !== null && lastMappingChannels >= 6;
+  btn.classList.toggle("is-hidden", !usable);
 }
 
 function onMonitorsChanged(jsonStr) {
@@ -1172,6 +1202,14 @@ window.AR = {
     else if (id === "preset-select") AR.applyPreset(value);
   },
 
+  // ── Angle mapping (surround/stereo) ─────────────────────────────
+  toggleMapping() {
+    if (!bridge.set_mapping_mode) return;
+    // Flip the mode the backend reports; the UI syncs back via
+    // mappingStateChanged (authoritative, avoids racing rapid clicks).
+    bridge.set_mapping_mode(lastMappingMode === "surround" ? "stereo" : "surround");
+  },
+
   // ── Mono output ────────────────────────────────────────────────
   setMonoEnabled(on) {
     if (bridge.set_mono_enabled) bridge.set_mono_enabled(!!on);
@@ -1510,6 +1548,7 @@ function syncToggleUI() {
     dot.classList.toggle("status-dot--on", radarActive);
     dot.classList.toggle("status-dot--off", !radarActive);
   }
+  updateMappingVisibility();
 }
 
 function syncMoveUI() {

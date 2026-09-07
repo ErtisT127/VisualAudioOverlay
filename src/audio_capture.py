@@ -3,11 +3,10 @@ import os
 import threading
 import time
 
-import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from app_logging import LOG_DEBUG_ENV, get_logger
-from direction import band_rms, detect_surround_mode, fold_surround, stereo_angle, surround_angle
+from direction import band_rms, stereo_angle, stereo_downmix, surround_angle, surround_intensity
 
 logger = get_logger("audio_capture")
 
@@ -77,8 +76,14 @@ class AudioCaptureThread(QThread):
         self._metrics_enabled = (
             os.environ.get(LOG_DEBUG_ENV) == "1" if metrics_enabled is None else bool(metrics_enabled)
         )
+        # Slots 0-4 are the live audio parameters; slot 5 is the mapping
+        # choice for >=6-channel wires (1.0 = surround, 0.0 = stereo). Every
+        # capture start builds a fresh thread and therefore a fresh array, so
+        # slot 5 comes up as surround - the session default - and an in-run
+        # toggle dies with the thread: a per-session choice, never a
+        # remembered one.
         self._shared_params = shared_params or mp.get_context("spawn").Array(
-            "d", [sensitivity, gain, freq_low, freq_high, max_amplitude]
+            "d", [sensitivity, gain, freq_low, freq_high, max_amplitude, 1.0]
         )
 
     def publish_latest_audio(self, angle, intensity):
@@ -146,6 +151,13 @@ class AudioCaptureThread(QThread):
     def set_max_amplitude(self, max_amp):
         self.max_amplitude = max_amp
         self._shared_params[4] = max_amp
+
+    def set_mapping_mode(self, mode):
+        """Choose the angle mapping used on >=6-channel wires: 'surround' (full
+        360 degrees across the wire's real speaker layout, 5.1 or 7.1) or
+        'stereo' (the whole wire folded down to L/R). Read fresh every block,
+        so a flip applies live without a restart."""
+        self._shared_params[5] = 1.0 if mode == "surround" else 0.0
 
     def _user_failure_message(self):
         label = self.target_name or (f"PID {self.target_pid}" if self.target_pid else "system audio")
@@ -313,7 +325,9 @@ class AudioCaptureThread(QThread):
             self.error_signal.emit(message)
             return
 
-        cap = ProcessLoopbackCapture(self.target_pid, samplerate=self.samplerate, channels=2)
+        # The stream opens at the endpoint's shared-mode mix format (channels
+        # resolved inside start()), not a hard-coded stereo pair.
+        cap = ProcessLoopbackCapture(self.target_pid, samplerate=self.samplerate)
         try:
             cap.start()
         except Exception:
@@ -323,18 +337,19 @@ class AudioCaptureThread(QThread):
             return
 
         label = self.target_name or f"PID {self.target_pid}"
-        logger.info("Capturing app audio: %s (per-app, Stereo L/R)", label)
-        self.device_info_signal.emit(f"{label} (per-app)", 2)
+        channels = int(cap.channels)
+        logger.info("Capturing app audio: %s (per-app, wire %sch)", label, channels)
+        self.device_info_signal.emit(f"{label} (per-app)", channels)
         reads = 0
         try:
             first_data = cap.read(AUDIO_BLOCK_FRAMES)
             self.ready_signal.emit()
             self._feed_mono(first_data)
-            self._process_chunk(first_data, use_surround=False)
+            self._process_chunk(first_data, channels)
             while self.running:
                 data = cap.read(AUDIO_BLOCK_FRAMES)
                 self._feed_mono(data)
-                self._process_chunk(data, use_surround=False)
+                self._process_chunk(data, channels)
                 reads += 1
                 # The stream gives no error of its own when the target exits;
                 # its session just goes silent. Prove liveness ~every 0.5s
@@ -401,39 +416,23 @@ class AudioCaptureThread(QThread):
         try:
             with device.recorder(samplerate=self.samplerate) as mic:
                 first_data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
-                raw_channels = first_data.shape[1]
-
-                # Surround mode locks in on the first block with real content;
-                # silence never decides, so a muted 7.1 device keeps the verdict
-                # (and the single device_info reporting it) pending until audio
-                # arrives. <6ch devices are stereo outright and report at once.
-                use_surround = False
-                effective = min(raw_channels, 2)
-                mode = "Stereo L/R"
-                unsettled = raw_channels >= 6
-                if not unsettled:
-                    logger.info("Channels: %s | Mode: %s", raw_channels, mode)
-                    self.device_info_signal.emit(device.name, effective)
+                # The stream's channel count is the endpoint's shared-mode mix
+                # format, fixed at open - report it as-is. No content probe:
+                # channels are a device property, and a silent multichannel
+                # device is still a multichannel device. The mapping listed is
+                # the session default for that wire (surround on >=6ch); the
+                # user can switch to stereo live, which the GUI logs.
+                wire_channels = int(first_data.shape[1])
+                mapping = "surround" if wire_channels >= 6 else ("stereo" if wire_channels >= 2 else "mono")
+                logger.info("Wire channels: %s | mapping: %s", wire_channels, mapping)
+                self.device_info_signal.emit(device.name, wire_channels)
 
                 self.ready_signal.emit()
 
                 data = first_data
                 while self.running:
                     self._feed_mono(data)
-                    if unsettled:
-                        # Probing needs per-block peak levels only while the
-                        # verdict is open; afterwards the mode is locked.
-                        verdict = detect_surround_mode(np.max(np.abs(data), axis=0), raw_channels)
-                        if verdict is not None:
-                            unsettled = False
-                            if verdict:
-                                use_surround = True
-                                effective = raw_channels
-                                mode = "360° Surround"
-                            logger.info("Channels: %s | Mode: %s", raw_channels, mode)
-                            self.device_info_signal.emit(device.name, effective)
-                    if not unsettled:
-                        self._process_chunk(data, use_surround)
+                    self._process_chunk(data, wire_channels)
                     if self.running:
                         data = mic.record(numframes=AUDIO_BLOCK_FRAMES)
 
@@ -443,7 +442,7 @@ class AudioCaptureThread(QThread):
                 message = self._user_failure_message()
                 self.error_signal.emit(message)
 
-    def _process_chunk(self, data, use_surround):
+    def _process_chunk(self, data, channel_count):
         self.sensitivity = float(self._shared_params[0])
         self.gain = float(self._shared_params[1])
         self.freq_low = int(self._shared_params[2])
@@ -455,15 +454,28 @@ class AudioCaptureThread(QThread):
 
         angle_deg = 0.0
 
-        if use_surround and data.shape[1] >= 6:
-            # 5.1 maps directly onto the radar levels; 7.1's side channels
-            # fold into the rear pair (A2). LFE is never a radar level.
-            fl, fr, c, rl, rr = fold_surround(rms)
-            intensity = max(fl, fr, c, rl, rr)
-            if intensity > self.sensitivity and intensity < self.max_amplitude:
-                angle_deg = surround_angle(fl, fr, c, rl, rr)
+        if channel_count >= 6:
+            # Real speaker geometry per wire: the 5.1 and 7.1 layouts each
+            # render their own full ring (only 7.1 has a side pair at +-90,
+            # distinct from the back pair at +-135). LFE never participates.
+            # The mapping is the user's session choice, not a content verdict:
+            # surround spans the full ring, stereo folds the whole wire into
+            # the L/R pair its own stereo downmix would carry - centre and
+            # rear content stays audible, just on the left/right axis.
+            # Intensity is the loudest ring speaker, never a sum - a
+            # side+back pair on the same side points between them, not louder
+            # than either.
+            if float(self._shared_params[5]) > 0.5:
+                intensity = surround_intensity(rms, channel_count)
+                if intensity > self.sensitivity and intensity < self.max_amplitude:
+                    angle_deg = surround_angle(rms, channel_count)
+            else:
+                left_rms, right_rms = stereo_downmix(rms, channel_count)
+                intensity = max(left_rms, right_rms)
+                if intensity > self.sensitivity and intensity < self.max_amplitude:
+                    angle_deg = stereo_angle(left_rms, right_rms)
 
-        elif data.shape[1] >= 2:
+        elif channel_count >= 2:
             left_rms, right_rms = float(rms[0]), float(rms[1])
             intensity = max(left_rms, right_rms)
             if intensity > self.sensitivity and intensity < self.max_amplitude:

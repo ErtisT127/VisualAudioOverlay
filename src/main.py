@@ -328,6 +328,17 @@ AUDIO_PARAM_LIMITS = {
     "freq_high": (int, 20, 20000),
     "max_amp": (float, 0.01, 1.0),
 }
+
+# Angle mapping used on >=6-channel wires. Session-only choice shown next to
+# the device channel count: "surround" spans the full 360 degrees across the
+# wire's real speaker layout (5.1 or 7.1); "stereo" downmixes the whole wire
+# to an L/R pair (centre and rear/side fold into the sides at 1/sqrt(2), so
+# nothing audible is dropped - the L/R pan a stereo mix would have). The
+# default is derived from the wire at every capture start (surround on >=6ch,
+# stereo below) - never persisted, so a 2-channel device can never inherit a
+# surround choice.
+MAPPING_MODES = ("stereo", "surround")
+_MAPPING_LABELS = {"stereo": "Stereo L/R", "surround": "Surround 360°"}
 PROFILE_PARAM_LIMITS = {
     "sensitivity": (int, 1, 500),
     "gain": (int, 10, 500),
@@ -839,6 +850,7 @@ class Bridge(QObject):
     programsSupportedChanged = pyqtSignal(bool)  # per-app capture available on this OS
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
     monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
+    mappingStateChanged = pyqtSignal(str)  # wire channels + mapping mode as JSON
     updateAvailable = pyqtSignal(str, str)  # (latest_version, release_page_url)
     appearanceChanged = pyqtSignal(str)  # saved overlay accent colour + thickness as JSON
     selectedPresetChanged = pyqtSignal(str)  # internal preset option key
@@ -965,6 +977,11 @@ class Bridge(QObject):
     def set_mono_enabled(self, enabled: bool):
         """Turn the in-app mono down-mix on/off. Applies live while running."""
         self._app.set_mono_enabled(enabled)
+
+    @pyqtSlot(str)
+    def set_mapping_mode(self, mode: str):
+        """Switch the angle mapping (surround / stereo) live while capturing."""
+        self._app.set_mapping_mode(mode)
 
     @pyqtSlot(str)
     def set_mono_output(self, device: str):
@@ -1283,6 +1300,14 @@ class AudioRadarApp(QMainWindow):
         self.stroke_width = _bounded_number(self.settings.get("stroke_width", 6), int, 1, 20) or 6
         self.overlay.set_accent_color(self.accent_color)
         self.overlay.set_stroke_width(self.stroke_width)
+
+        # Angle-mapping session state (MAPPING_MODES). None until the first
+        # device_info: the dashboard shows nothing about a mode before a wire
+        # is actually captured, and each capture start re-derives the default
+        # (surround on >=6ch) from the channels it opens with.
+        self._mapping_mode = None
+        self._last_device = None  # (name, channels) of the most recent device_info
+        self._wire_channels = None
 
         # Audio thread (starts idle, no capture yet)
         self._new_audio_thread()
@@ -1687,8 +1712,46 @@ class AudioRadarApp(QMainWindow):
         self.overlay.update_audio_data(angle, intensity, generation)
 
     def on_device_info(self, name: str, channels: int):
-        label = f"{name}  ({channels}ch)"
+        # A capture stream just opened. The channel count is the wire's engine
+        # format (static), so it also picks this session's mapping default:
+        # surround on >=6ch, stereo below. The mode text rides inside the same
+        # "(Nch)" label, which is how it ends up right of the channel count.
+        self._last_device = (name, channels)
+        self._wire_channels = channels
+        self._mapping_mode = "surround" if channels >= 6 else "stereo"
+        self._emit_device_label()
+        self.emit_mapping_state()
+
+    def _emit_device_label(self):
+        """Rebuild the deviceChanged label from the cached device so callers
+        (device_info, mode switches) share one formatting path."""
+        if self._last_device is None:
+            return
+        name, channels = self._last_device
+        label = f"{name}  ({channels}ch · {_MAPPING_LABELS[self._mapping_mode]})"
         self.bridge.deviceChanged.emit(label)
+
+    def set_mapping_mode(self, mode: str):
+        """Switch the angle mapping live (surround <-> stereo). Session-only:
+        applied to the running thread right now, never persisted - the next
+        capture start re-derives its default from the wire channels."""
+        if mode not in MAPPING_MODES:
+            logger.warning("invalid mapping mode ignored mode=%r", mode)
+            return
+        if mode == self._mapping_mode:
+            return
+        logger.info("mapping mode changed from=%s to=%s", self._mapping_mode, mode)
+        self._mapping_mode = mode
+        if self.audio_thread is not None:
+            self.audio_thread.set_mapping_mode(mode)
+        self._emit_device_label()
+        self.emit_mapping_state()
+
+    def emit_mapping_state(self):
+        """Push the current mapping choice and wire channels to the dashboard
+        so the switch reflects what the capture thread is using."""
+        state = {"channels": self._wire_channels, "mode": self._mapping_mode}
+        self.bridge.mappingStateChanged.emit(json.dumps(state))
 
     def on_capture_status(self, message: str):
         """Non-terminal capture status intended for the UI."""
