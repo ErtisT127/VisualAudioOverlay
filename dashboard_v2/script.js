@@ -21,12 +21,6 @@
  *   selectedPresetChanged(str)    - selected option state as JSON
  *   audioSettingsChanged(jsonStr) - the live sensitivity/gain/freq/max-amp, so the
  *                                   sliders follow a preset and come back on load
- *
- * Mono output (single-sided listeners) - guarded so the UI works without them:
- *   set_mono_enabled(bool)      - turn the in-app mono down-mix on/off
- *   set_mono_output(str)        - which real device the mono mix plays to
- *   install_vbcable()           - launch the bundled VB-CABLE installer
- *   monoStateChanged(jsonStr)   - {devices, default, cable, enabled, selected}
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -89,7 +83,6 @@ function initBridge() {
       if (bridge.programsChanged) bridge.programsChanged.connect(onProgramsChanged);
       if (bridge.programsSupportedChanged)
         bridge.programsSupportedChanged.connect(onProgramsSupportedChanged);
-      if (bridge.monoStateChanged) bridge.monoStateChanged.connect(onMonoStateChanged);
       if (bridge.mappingStateChanged) bridge.mappingStateChanged.connect(onMappingStateChanged);
       if (bridge.updateAvailable) bridge.updateAvailable.connect(onUpdateAvailable);
       if (bridge.appearanceChanged) bridge.appearanceChanged.connect(onAppearanceChanged);
@@ -343,6 +336,7 @@ function onMappingStateChanged(jsonStr) {
     return;
   }
   updateMappingVisibility();
+  drawPreview(); // The preview ring shape follows the mapping mode.
 }
 
 function updateMappingVisibility() {
@@ -426,7 +420,7 @@ function onProgramsSupportedChanged(supported) {
 }
 
 // ── Live dropdowns (every select on the panel) ───────────────────────
-// All four lists (monitor / program / preset / mono output) are plain DOM
+// All three lists (monitor / program / preset) are plain DOM
 // menus instead of native <select>s. A native popup cannot be themed or
 // rebuilt while open in QtWebEngine, which is exactly when a session list
 // must NOT wait: monitors connect and games start playing audio while the
@@ -604,46 +598,6 @@ function onAudioSettingsChanged(jsonStr) {
     setSliderValue("max-amp", slider);
     setText("max-amp-val", p.max_amp.toFixed(2));
     setFill("max-amp", slider);
-  }
-}
-
-// Mono-output state: device list + VB-CABLE detection + current selection.
-function onMonoStateChanged(jsonStr) {
-  const s = JSON.parse(jsonStr);
-
-  const opts = [
-    { value: "", label: "System default" + (s.default ? ` (${s.default})` : "") },
-    ...(s.devices || []).map((d) => ({ value: d, label: d })),
-  ];
-  // "" is a real option value here (System default), so it is passed through
-  // as the preferred pick rather than being treated as "no selection".
-  liveFill("mono-output-select", opts, s.selected || "");
-
-  const cb = document.getElementById("mono-enabled");
-  if (cb) cb.checked = !!s.enabled;
-
-  // Compact hint shown in the HARDWARE card (the full setup lives in the modal).
-  const hint = document.getElementById("mono-hint");
-  if (hint) {
-    const where = s.selected || (s.default ? "default device" : "default");
-    const state = s.enabled ? `On - ${where}` : "Off";
-    hint.innerHTML =
-      `${state} <a href="#" class="mono-setup-link" ` +
-      `onclick="AR.openMonoSetup(); return false;">Setup</a>`;
-  }
-
-  // Cable status + install button live in the modal (which scrolls, so no clip).
-  const status = document.getElementById("mono-status");
-  const installBtn = document.getElementById("mono-install-btn");
-  if (s.cable) {
-    if (status) status.innerHTML = `<span class="ok">Virtual cable detected:</span> ${s.cable}`;
-    if (installBtn) installBtn.classList.add("is-hidden");
-  } else {
-    if (status)
-      status.innerHTML =
-        `<span class="warn">No virtual cable found.</span> Install VB-CABLE to ` +
-        `route your game's audio without hearing it twice.`;
-    if (installBtn) installBtn.classList.remove("is-hidden");
   }
 }
 
@@ -1142,8 +1096,8 @@ window.AR = {
   refreshDropdown(id) {
     if (window._dashboardFrozen || document.hidden) return;
     // Only monitor/program lists come from the backend's live enumeration;
-    // preset and mono lists arrive on their own signals, so opening those
-    // menus needs no round-trip.
+    // the preset list arrives on its own signal, so opening it needs no
+    // round-trip.
     if (id !== "monitor-select" && id !== "program-select") {
       resetDropdownRefreshTimer();
       return;
@@ -1198,7 +1152,6 @@ window.AR = {
     if (trigger && typeof trigger.focus === "function") trigger.focus();
     if (id === "monitor-select") AR.setMonitor(parseInt(value));
     else if (id === "program-select") AR.setProgram(value);
-    else if (id === "mono-output-select") AR.setMonoOutput(value);
     else if (id === "preset-select") AR.applyPreset(value);
   },
 
@@ -1208,27 +1161,6 @@ window.AR = {
     // Flip the mode the backend reports; the UI syncs back via
     // mappingStateChanged (authoritative, avoids racing rapid clicks).
     bridge.set_mapping_mode(lastMappingMode === "surround" ? "stereo" : "surround");
-  },
-
-  // ── Mono output ────────────────────────────────────────────────
-  setMonoEnabled(on) {
-    if (bridge.set_mono_enabled) bridge.set_mono_enabled(!!on);
-    if (on) AR.openMonoSetup(); // first enable: walk them through setup
-  },
-
-  setMonoOutput(value) {
-    if (bridge.set_mono_output) bridge.set_mono_output(value);
-  },
-
-  openMonoSetup() {
-    toggleClass("mono-modal", "is-hidden", false);
-  },
-  closeMonoSetup() {
-    toggleClass("mono-modal", "is-hidden", true);
-  },
-
-  installCable() {
-    if (bridge.install_vbcable) bridge.install_vbcable();
   },
 
   toggleMoveMode() {
@@ -1360,6 +1292,14 @@ function applyProfileValues(p) {
 // native overlay: faint white base circle + accent-coloured arc "blips",
 // 35° span, round cap, stroke width = thickness. Here we draw one static
 // sample blip so the user sees the chosen colour + thickness style.
+function ringIsFullCircle() {
+  // The ring spans the front hemisphere (a dial, not a full circle) while
+  // the stereo mapping is active; surround covers a full 360°. Unknown - no
+  // wire captured yet - keeps the full circle, matching the overlay's
+  // default.
+  return lastMappingMode !== "stereo";
+}
+
 function drawPreview() {
   const canvas = document.getElementById("preview-canvas");
   if (!canvas) return;
@@ -1399,9 +1339,23 @@ function drawPreview() {
 
   ctx.clearRect(0, 0, W, H);
 
-  // Base circle (matches overlay: white @ ~12% alpha, 2px)
+  // Base ring (matches overlay: white @ ~12% alpha, 2px). Stereo mapping
+  // draws a dial instead of the full ring, which would promise directions
+  // stereo cannot resolve: the front arc dips exactly half the 35° blip
+  // span below each horizontal end (same as the native overlay), so a blip
+  // panned hard left/right reaches the ring ends flush, while the open
+  // bottom implies no rear directions.
   ctx.beginPath();
-  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  if (ringIsFullCircle()) {
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  } else {
+    // Canvas angles run clockwise: PI = left end, 3PI/2 = top, 2PI = right.
+    // The dial therefore starts PI below the left end and sweeps over the
+    // top to 2PI below the right end. Must match kArcSpan/2 = 17.5 degrees
+    // in overlay_native.cpp.
+    const dialOverhang = (17.5 * Math.PI) / 180;
+    ctx.arc(cx, cy, radius, Math.PI - dialOverhang, Math.PI * 2 + dialOverhang);
+  }
   ctx.strokeStyle = "rgba(255,255,255,0.18)";
   ctx.lineWidth = 2;
   ctx.stroke();
@@ -1502,8 +1456,8 @@ window.setDashboardFrozen = function (frozen) {
 // (the runaway-dropdown bug) while the popup focus-churn retriggered a
 // blocking COM enumeration on every window focus. 49b828f diff-guarded the
 // program list; monitor and program moved to in-place-rebuildable DOM menus;
-// and now every select on the panel (preset and mono-output included) is a
-// DOM menu (see the Live dropdowns section), so no deferral machinery
+// and now every select on the panel (preset included) is a DOM menu (see the
+// Live dropdowns section), so no deferral machinery
 // remains - fills always land immediately, open or not.
 //
 // `_pendingFills` (deferred native-select rebuilds) was removed along with
@@ -1631,7 +1585,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // Live menus: click opens (and always re-enumerates while opening). Arrow
   // keys on the closed trigger open it like a native popup would.
-  ["monitor-select", "program-select", "preset-select", "mono-output-select"].forEach((id) => {
+  ["monitor-select", "program-select", "preset-select"].forEach((id) => {
     const trigger = document.getElementById(id);
     if (!trigger) return;
     trigger.addEventListener("click", () => AR.toggleLiveSelect(id));

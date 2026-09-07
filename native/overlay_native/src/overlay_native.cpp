@@ -41,6 +41,7 @@ constexpr int kDefaultWidth = 300;
 constexpr int kDefaultHeight = 300;
 constexpr float kDecay = 0.04f;
 constexpr float kArcSpan = 35.0f;
+constexpr float kPi = 3.1415926535f;
 constexpr float kVisualGain = 5.0f;
 constexpr size_t kMaxBlips = 64;
 constexpr size_t kMaxEvents = 32;
@@ -251,6 +252,7 @@ class Overlay {
             height_ = height;
             for (auto &blip : blips_)
                 blip.geometry.Reset();
+            dial_ring_.Reset(); // The cached dial bakes in the old radius.
             SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height,
                          SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             recreate_target_ = true;
@@ -306,6 +308,15 @@ class Overlay {
         return command([this, color_rgba, stroke_width] {
             color_ = color_rgba;
             stroke_width_ = stroke_width;
+            dirty_ = true;
+        });
+    }
+
+    int set_mapping_mode(bool full_ring) {
+        return command([this, full_ring] {
+            if (full_ring_ == full_ring)
+                return;
+            full_ring_ = full_ring;
             dirty_ = true;
         });
     }
@@ -807,6 +818,51 @@ class Overlay {
         return true;
     }
 
+    // The stereo-mode base ring: a cached dial path, not a full circle. A
+    // strict semicircle would still drop the far edges of hard-pan blips past
+    // its ends, so the dial keeps the front-hemisphere arc and dips
+    // kArcSpan/2 below the horizontal at each end (angle a runs right at 0,
+    // over the top at 90, to left at 180; negative angles droop below the
+    // right end, angles past 180 below the left). A blip panned hard left or
+    // right is centered exactly on a horizontal end and spans kArcSpan/2
+    // each way, so the dial ends flush with the farthest blip edge - no dead
+    // ring past the directions stereo can produce, and the open bottom keeps
+    // rear directions unimplied.
+    bool ensure_dial_ring_geometry() {
+        if (dial_ring_)
+            return true;
+        const float cx = static_cast<float>(width_) * 0.5f;
+        const float cy = static_cast<float>(height_) * 0.5f;
+        const float radius = static_cast<float>(std::min(width_, height_)) * 0.4f;
+        ComPtr<ID2D1PathGeometry> geometry;
+        if (FAILED(d2d_factory_->CreatePathGeometry(&geometry)))
+            return false;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(geometry->Open(&sink)))
+            return false;
+        auto point = [cx, cy, radius](float angle) {
+            return D2D1::Point2F(cx + radius * std::cos(angle), cy - radius * std::sin(angle));
+        };
+        const float start = -kArcSpan * 0.5f * kPi / 180.0f;
+        const float end = kPi + kArcSpan * 0.5f * kPi / 180.0f;
+        // Fixed sub-180 steps keep every AddArc unambiguous; the final
+        // segment simply comes out shorter.
+        const float step = 45.0f * kPi / 180.0f;
+        const int segments = static_cast<int>(std::ceil((end - start) / step));
+        sink->BeginFigure(point(start), D2D1_FIGURE_BEGIN_HOLLOW);
+        for (int i = 1; i <= segments; ++i) {
+            sink->AddArc(D2D1::ArcSegment(
+                point(std::min(start + step * static_cast<float>(i), end)),
+                D2D1::SizeF(radius, radius), 0.0f, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                D2D1_ARC_SIZE_SMALL));
+        }
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        if (FAILED(sink->Close()))
+            return false;
+        dial_ring_ = std::move(geometry);
+        return true;
+    }
+
     // Returns true when the new content reached the composition tree. On
     // failure the caller keeps dirty_ set so the state that was not drawn
     // stays pending.
@@ -890,8 +946,18 @@ class Overlay {
         d2d_context_->CreateSolidColorBrush(color, &brush);
         ComPtr<ID2D1SolidColorBrush> base;
         d2d_context_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 30.0f / 255.0f), &base);
-        d2d_context_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), base.Get(),
-                                  2.0f);
+        if (full_ring_ || drag_enabled_) {
+            d2d_context_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), base.Get(),
+                                      2.0f);
+        } else {
+            // Stereo mapping can only resolve the front hemisphere; a full
+            // ring would promise directions that never occur. Drag mode keeps
+            // the full circle above: its ring is a placement example. The
+            // dial's ends hang below the horizontal so blips panned hard
+            // left/right keep their entire arc on the ring.
+            if (ensure_dial_ring_geometry())
+                d2d_context_->DrawGeometry(dial_ring_.Get(), base.Get(), 2.0f);
+        }
         for (auto &blip : blips_) {
             // QWidget used QColor(alpha=int(life * 255)). Draw at the same
             // 255-level opacity and record the level actually submitted, so
@@ -1077,6 +1143,10 @@ class Overlay {
     uint64_t generation_ = 0;
     uint32_t color_ = 0x9751F2FF;
     float stroke_width_ = 6.0f;
+    // True draws a full 360-degree base ring (surround mapping); false draws
+    // the front-hemisphere dial (stereo). Starts full until the first mapping
+    // is pushed, and drag mode always forces the full shape.
+    bool full_ring_ = true;
     uint64_t next_decay_ = 0;
     std::vector<Blip> blips_;
     std::string diag_path_;
@@ -1095,6 +1165,7 @@ class Overlay {
     ComPtr<ID2D1DeviceContext> d2d_context_;
     ComPtr<ID2D1StrokeStyle> round_stroke_;
     ComPtr<ID2D1StrokeStyle> dash_stroke_;
+    ComPtr<ID2D1PathGeometry> dial_ring_;
     ComPtr<IDCompositionDevice> dcomp_device_;
     ComPtr<IDCompositionTarget> dcomp_target_;
     ComPtr<IDCompositionVisual> dcomp_visual_;
@@ -1145,6 +1216,9 @@ VAO_API int vao_set_generation(void *handle, uint64_t generation) {
 VAO_API int vao_set_style(void *handle, uint32_t c, float w) {
     return with_handle(handle, [=](Overlay *o) { return o->set_style(c, w); });
 }
+VAO_API int vao_set_mapping_mode(void *handle, int mode) {
+    return with_handle(handle, [=](Overlay *o) { return o->set_mapping_mode(mode == 1); });
+}
 VAO_API int vao_submit_audio(void *handle, uint64_t g, float a, float i, int64_t t) {
     return with_handle(handle, [=](Overlay *o) { return o->submit_audio(g, a, i, t); });
 }
@@ -1162,6 +1236,7 @@ VAO_API int set_geometry(void *h, int32_t x, int32_t y, int32_t w, int32_t z) {
 VAO_API int set_drag_enabled(void *h, int e) { return vao_set_drag_enabled(h, e); }
 VAO_API int set_generation(void *h, uint64_t g) { return vao_set_generation(h, g); }
 VAO_API int set_style(void *h, uint32_t c, float w) { return vao_set_style(h, c, w); }
+VAO_API int set_mapping_mode(void *h, int m) { return vao_set_mapping_mode(h, m); }
 VAO_API int submit_audio(void *h, uint64_t g, float a, float i, int64_t t) {
     return vao_submit_audio(h, g, a, i, t);
 }

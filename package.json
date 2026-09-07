@@ -1,6 +1,6 @@
 {
   "name": "visual-audio-overlay",
-  "version": "0.2.31",
+  "version": "0.2.32",
   "private": true,
   "packageManager": "pnpm@11.3.0",
   "scripts": {

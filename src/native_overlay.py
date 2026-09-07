@@ -158,6 +158,8 @@ class NativeOverlay(QObject):
             ctypes.c_float,
         ]
         self._dll.vao_set_style.restype = ctypes.c_int
+        self._dll.vao_set_mapping_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._dll.vao_set_mapping_mode.restype = ctypes.c_int
         self._dll.vao_submit_audio.argtypes = [
             ctypes.c_void_p,
             ctypes.c_uint64,
@@ -449,6 +451,16 @@ class NativeOverlay(QObject):
         self._generation = int(generation)
         if not self._dll.vao_set_generation(self._handle, self._generation):
             raise RuntimeError("failed to change native overlay generation")
+
+    def set_mapping_mode(self, mode: str):
+        """Switch the ring shape for the angle mapping in use.
+
+        Stereo (L/R only) draws the front-hemisphere dial; surround draws
+        the full 360-degree ring. ``mode`` must be a MAPPING_MODES member;
+        the native overlay owns the state, this is a one-way push.
+        """
+        if not self._dll.vao_set_mapping_mode(self._handle, 0 if mode == "stereo" else 1):
+            raise RuntimeError("failed to change native overlay mapping mode")
 
     def update_audio_data(self, angle, intensity, generation=None):
         if generation is None:

@@ -14,7 +14,6 @@
 # nuitka-project: --include-module=audio_capture
 # nuitka-project: --include-module=app_logging
 # nuitka-project: --include-module=direction
-# nuitka-project: --include-module=mono_output
 # nuitka-project: --include-module=process_loopback
 
 # nuitka-project: --include-package=comtypes
@@ -266,7 +265,7 @@ TRAY_ICON = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
 # ── Version + project links ─────────────────────────────────────────────────
 # APP_VERSION is the release tag without its leading "v" (e.g. tag "v0.2.31"
 # matches APP_VERSION "0.2.31"). The comparison strips "vV" on both sides.
-APP_VERSION = "0.2.31"
+APP_VERSION = "0.2.32"
 REPO_URL = "https://github.com/ErtisT127/VisualAudioOverlay"
 # Latest-release JSON (no auth needed; 60 req/hr per IP is plenty for one check
 # per launch). Used by the in-app update check to reach users who already have
@@ -329,16 +328,35 @@ AUDIO_PARAM_LIMITS = {
     "max_amp": (float, 0.01, 1.0),
 }
 
-# Angle mapping used on >=6-channel wires. Session-only choice shown next to
-# the device channel count: "surround" spans the full 360 degrees across the
-# wire's real speaker layout (5.1 or 7.1); "stereo" downmixes the whole wire
-# to an L/R pair (centre and rear/side fold into the sides at 1/sqrt(2), so
-# nothing audible is dropped - the L/R pan a stereo mix would have). The
-# default is derived from the wire at every capture start (surround on >=6ch,
-# stereo below) - never persisted, so a 2-channel device can never inherit a
-# surround choice.
+# Angle mapping used on >=6-channel wires. Shown next to the device channel
+# count: "surround" spans the full 360 degrees across the wire's real speaker
+# layout (5.1 or 7.1); "stereo" downmixes the whole wire to an L/R pair
+# (centre and rear/side fold into the sides at 1/sqrt(2), so nothing audible
+# is dropped - the L/R pan a stereo mix would have). Both mappings exist only
+# on >=6ch wires; anything narrower is captured stereo regardless.
+#
+# settings["mapping_mode"] holds the priority between the two: the mapping a
+# >=6ch wire opens with at every capture start. It defaults to surround and
+# the only writer is the user's own dashboard toggle (set_mapping_mode), so
+# someone who never switches keeps the surround default and someone who has
+# keeps their choice across restarts and relaunches. Wire starts never write
+# it, so a 2-channel device can never pin the priority to stereo.
 MAPPING_MODES = ("stereo", "surround")
 _MAPPING_LABELS = {"stereo": "Stereo L/R", "surround": "Surround 360°"}
+
+
+def _normalize_mapping_priority(value):
+    """Validate a persisted mapping priority, defaulting to surround."""
+    return value if isinstance(value, str) and value in MAPPING_MODES else "surround"
+
+
+def _mapping_for_wire(channels, priority):
+    """Mapping a freshly opened wire starts with: the remembered priority when
+    the wire offers both mappings (>=6ch), stereo otherwise - a stored
+    surround preference must never claim a narrower wire can do surround."""
+    return priority if channels >= 6 else "stereo"
+
+
 PROFILE_PARAM_LIMITS = {
     "sensitivity": (int, 1, 500),
     "gain": (int, 10, 500),
@@ -562,23 +580,6 @@ class ProgramListThread(QThread):
                 names = []
         if not self.isInterruptionRequested():
             self.result.emit(json.dumps(names))
-
-
-class MonoDeviceListThread(QThread):
-    """Enumerate soundcard devices without blocking the GUI event loop."""
-
-    result = pyqtSignal(str)
-
-    def run(self):
-        try:
-            from mono_output import output_device_state
-
-            state = output_device_state()
-        except Exception:
-            logger.exception("Mono device enumeration failed")
-            state = {"devices": [], "default": None, "cable": None}
-        if not self.isInterruptionRequested():
-            self.result.emit(json.dumps(state))
 
 
 class GlobalHotkeyFilter(QAbstractNativeEventFilter):
@@ -849,7 +850,6 @@ class Bridge(QObject):
     programsChanged = pyqtSignal(str)  # running audio programs as JSON
     programsSupportedChanged = pyqtSignal(bool)  # per-app capture available on this OS
     overlayPositionChanged = pyqtSignal(str)  # overlay position/state as JSON
-    monoStateChanged = pyqtSignal(str)  # mono-output devices + cable state as JSON
     mappingStateChanged = pyqtSignal(str)  # wire channels + mapping mode as JSON
     updateAvailable = pyqtSignal(str, str)  # (latest_version, release_page_url)
     appearanceChanged = pyqtSignal(str)  # saved overlay accent colour + thickness as JSON
@@ -972,32 +972,10 @@ class Bridge(QObject):
         """Refresh the monitor list when its dropdown is opened."""
         self._app.emit_monitors()
 
-    # ── Mono output (single-sided listeners) ──────────────────────────
-    @pyqtSlot(bool)
-    def set_mono_enabled(self, enabled: bool):
-        """Turn the in-app mono down-mix on/off. Applies live while running."""
-        self._app.set_mono_enabled(enabled)
-
     @pyqtSlot(str)
     def set_mapping_mode(self, mode: str):
         """Switch the angle mapping (surround / stereo) live while capturing."""
         self._app.set_mapping_mode(mode)
-
-    @pyqtSlot(str)
-    def set_mono_output(self, device: str):
-        """Choose which real device the mono mix plays to. '' = system default."""
-        self._app.set_mono_output(device)
-
-    @pyqtSlot()
-    def refresh_mono_devices(self):
-        self._app.emit_mono_state()
-
-    @pyqtSlot()
-    def install_vbcable(self):
-        """Launch the bundled VB-CABLE installer (UAC-elevated) so mono output can
-        route the game away from the headphones. Falls back to the download page
-        if the installer isn't bundled in this build."""
-        self._app.install_vbcable()
 
     # ── Version / external links ──────────────────────────────────────
     @pyqtSlot(result=str)
@@ -1132,9 +1110,6 @@ class Bridge(QObject):
         # Overlay position
         self._app.emit_overlay_position()
 
-        # Mono-output devices + VB-CABLE detection
-        self._app.emit_mono_state()
-
 
 # ── Main Application ────────────────────────────────────────────────────────
 
@@ -1175,8 +1150,6 @@ class AudioRadarApp(QMainWindow):
         self._dashboard_freeze_timer.setInterval(600)
         self._dashboard_freeze_timer.timeout.connect(self._freeze_dashboard_if_hidden)
         self._program_list_thread = None
-        self._mono_device_thread = None
-        self._mono_refresh_pending = False
         self._capture_generation = 0
         self._active_capture_generation = None
         self._watchdog_generation = None
@@ -1274,11 +1247,6 @@ class AudioRadarApp(QMainWindow):
         self.settings["selected_preset"] = self.selected_preset
         self.settings["preset_state"] = dict(self.preset_state)
 
-        # Mono output (single-sided listeners). Persisted in settings.json so the
-        # user's choice survives restarts; applied to the audio thread on Start.
-        self.mono_enabled = bool(self.settings.get("mono_enabled", False))
-        self.mono_device = self.settings.get("mono_device") or None
-
         # Native Direct2D/DirectComposition overlay.  There is intentionally no
         # QWidget fallback: a failed native renderer must be visible and must not
         # silently reintroduce the compositor path this backend replaces.
@@ -1303,9 +1271,17 @@ class AudioRadarApp(QMainWindow):
 
         # Angle-mapping session state (MAPPING_MODES). None until the first
         # device_info: the dashboard shows nothing about a mode before a wire
-        # is actually captured, and each capture start re-derives the default
-        # (surround on >=6ch) from the channels it opens with.
+        # is actually captured, and every capture start re-derives the mapping
+        # from the channels its wire opens with (the remembered priority on
+        # >=6ch, stereo below). The priority itself is restored from
+        # settings.json, where the only writer is the user's own dashboard
+        # toggle; settings.json is hand-editable, so a bad value is skipped
+        # with a warning rather than trusted.
         self._mapping_mode = None
+        saved_mapping_priority = self.settings.get("mapping_mode")
+        self._mapping_priority = _normalize_mapping_priority(saved_mapping_priority)
+        if saved_mapping_priority is not None and self._mapping_priority != saved_mapping_priority:
+            logger.warning("invalid saved mapping priority normalized value=%r", saved_mapping_priority)
         self._last_device = None  # (name, channels) of the most recent device_info
         self._wire_channels = None
 
@@ -1713,14 +1689,22 @@ class AudioRadarApp(QMainWindow):
 
     def on_device_info(self, name: str, channels: int):
         # A capture stream just opened. The channel count is the wire's engine
-        # format (static), so it also picks this session's mapping default:
-        # surround on >=6ch, stereo below. The mode text rides inside the same
-        # "(Nch)" label, which is how it ends up right of the channel count.
+        # format (static), so it also picks the mapping for this capture run:
+        # the remembered priority when the wire offers both mappings (>=6ch),
+        # stereo otherwise. The mode text rides inside the same "(Nch)" label,
+        # which is how it ends up right of the channel count.
         self._last_device = (name, channels)
         self._wire_channels = channels
-        self._mapping_mode = "surround" if channels >= 6 else "stereo"
+        self._mapping_mode = _mapping_for_wire(channels, self._mapping_priority)
+        # The worker's DSP starts every capture with surround in its mapping
+        # slot, so the resolved mode has to be pushed now that the wire is
+        # known - a remembered stereo priority would otherwise be ignored
+        # until the user toggles. Idempotent for the surround default.
+        if self.audio_thread is not None:
+            self.audio_thread.set_mapping_mode(self._mapping_mode)
         self._emit_device_label()
         self.emit_mapping_state()
+        self.overlay.set_mapping_mode(self._mapping_mode)
 
     def _emit_device_label(self):
         """Rebuild the deviceChanged label from the cached device so callers
@@ -1732,9 +1716,13 @@ class AudioRadarApp(QMainWindow):
         self.bridge.deviceChanged.emit(label)
 
     def set_mapping_mode(self, mode: str):
-        """Switch the angle mapping live (surround <-> stereo). Session-only:
-        applied to the running thread right now, never persisted - the next
-        capture start re-derives its default from the wire channels."""
+        """Switch the angle mapping live (surround <-> stereo).
+
+        A manual switch is the one thing that may change the persisted
+        priority: the choice is written to settings.json and re-applied by
+        on_device_info whenever a wire that offers both mappings opens again -
+        after a capture restart or in a later session. Users who never toggle
+        keep the surround default; wire-derived starts never write this key."""
         if mode not in MAPPING_MODES:
             logger.warning("invalid mapping mode ignored mode=%r", mode)
             return
@@ -1742,8 +1730,13 @@ class AudioRadarApp(QMainWindow):
             return
         logger.info("mapping mode changed from=%s to=%s", self._mapping_mode, mode)
         self._mapping_mode = mode
+        self._mapping_priority = mode
+        if self.settings.get("mapping_mode") != mode:
+            self.settings["mapping_mode"] = mode
+            self._save_settings()
         if self.audio_thread is not None:
             self.audio_thread.set_mapping_mode(mode)
+        self.overlay.set_mapping_mode(mode)
         self._emit_device_label()
         self.emit_mapping_state()
 
@@ -2102,97 +2095,6 @@ class AudioRadarApp(QMainWindow):
             )
         )
 
-    # ── Mono output (single-sided listeners) ──────────────────────────
-    def set_mono_enabled(self, enabled: bool):
-        enabled = bool(enabled)
-        changed = enabled != self.mono_enabled
-        logger.info("mono output enabled changed from=%s to=%s", self.mono_enabled, enabled)
-        self.mono_enabled = enabled
-        self.settings["mono_enabled"] = self.mono_enabled
-        self._queue_settings_save()
-        self.emit_mono_state()
-        if changed:
-            self._restart_capture_if_active()
-
-    def set_mono_output(self, device: str):
-        device = device or None
-        changed = device != self.mono_device
-        logger.info("mono output device changed from=%s to=%s", self.mono_device, device)
-        self.mono_device = device
-        self.settings["mono_device"] = self.mono_device
-        self._queue_settings_save()
-        self.emit_mono_state()
-        if changed:
-            self._restart_capture_if_active()
-
-    def emit_mono_state(self):
-        """Push the playback-device list + VB-CABLE detection + current selection
-        to the UI so it can render the mono setup card."""
-        if self._mono_device_thread is not None:
-            # Do not replace a finished thread before its queued callback clears
-            # the reference; otherwise shutdown can lose the new worker.
-            self._mono_refresh_pending = True
-            return
-        self._mono_refresh_pending = False
-        thread = MonoDeviceListThread(self)
-        self._mono_device_thread = thread
-        thread.result.connect(self._on_mono_devices)
-        thread.finished.connect(self._on_mono_device_thread_finished)
-        thread.start()
-
-    def _on_mono_devices(self, payload):
-        if self._closing_for_exit:
-            return
-        state = json.loads(payload)
-        state.update({"enabled": self.mono_enabled, "selected": self.mono_device})
-        self.bridge.monoStateChanged.emit(json.dumps(state))
-
-    def _on_mono_device_thread_finished(self):
-        sender = self.sender()
-        thread = self._mono_device_thread
-        if sender is not None and sender is not thread:
-            logger.debug("stale mono device finished callback ignored")
-            sender.deleteLater()
-            return
-        self._mono_device_thread = None
-        if thread is not None:
-            thread.deleteLater()
-        if self._mono_refresh_pending and not self._closing_for_exit:
-            self.emit_mono_state()
-            return
-        self._mono_refresh_pending = False
-        self._maybe_finalize_exit()
-
-    def _stop_mono_device_thread(self):
-        thread = self._mono_device_thread
-        self._mono_refresh_pending = False
-        if thread is not None and thread.isRunning():
-            thread.requestInterruption()
-
-    def install_vbcable(self):
-        """Launch the bundled VB-CABLE installer with a UAC prompt. If the build
-        doesn't bundle it, open the official download page instead. The installer
-        shows its own UI on purpose (donationware terms + trust for the
-        anti-cheat-wary audience)."""
-        installer = os.path.join(RESOURCE_DIR, "vendor", "VBCABLE", "VBCABLE_Setup_x64.exe")
-        if os.path.exists(installer):
-            try:
-                import ctypes
-                import shutil
-                import tempfile
-
-                # Copy out of a temporary onefile bundle first so the installer
-                # remains available after the app exits.
-                tmp = os.path.join(tempfile.gettempdir(), "VBCABLE_Setup_x64.exe")
-                shutil.copyfile(installer, tmp)
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", tmp, None, None, 1)
-                return
-            except Exception:
-                logger.exception("VB-CABLE launch failed")
-        import webbrowser
-
-        webbrowser.open("https://vb-audio.com/Cable/")
-
     def _resolve_target(self):
         """Map the selected program name to a live PID via the process table.
 
@@ -2357,8 +2259,8 @@ class AudioRadarApp(QMainWindow):
 
     # ── Radar Control ─────────────────────────────────────────────────
     def _start_capture_thread(self):
-        """Configure the idle thread (target/mono/params are read at thread start)
-        and start it. Shared by Start and by mid-session capture restarts."""
+        """Configure the idle thread (target/params are read at thread start) and
+        start it. Shared by Start and by mid-session capture restarts."""
         if self._closing_for_exit or self.audio_thread is None:
             logger.debug("capture start skipped: closing or no thread")
             return False
@@ -2388,7 +2290,6 @@ class AudioRadarApp(QMainWindow):
             return False
         self.audio_thread.set_target(pid, name)
         self._capture_label = name or "system audio"
-        self.audio_thread.set_mono(self.mono_enabled, self.mono_device)
         self._apply_audio_settings_to_thread()
         self.audio_thread.clear_latest_audio()
 
@@ -2509,6 +2410,10 @@ class AudioRadarApp(QMainWindow):
         # that interactive state into the game session.
         self.overlay.set_drag_enabled(False)
         self.overlay.show()
+        # Re-apply the last known mapping so a restart does not flash the
+        # default full ring on a stereo wire before the first device_info.
+        if self._mapping_mode is not None:
+            self.overlay.set_mapping_mode(self._mapping_mode)
         if place_overlay:
             self._place_overlay_for_start()
         if self._start_capture_thread():
@@ -2832,7 +2737,6 @@ class AudioRadarApp(QMainWindow):
         self._capture_watchdog.stop()
         self._watchdog_generation = None
         self._stop_program_list_thread()
-        self._stop_mono_device_thread()
         self._set_operation_state("closing")
         if self.audio_thread is not None and self.audio_thread.isRunning():
             logger.info(
@@ -2850,17 +2754,9 @@ class AudioRadarApp(QMainWindow):
             logger.debug("finalize exit skipped: already finalized")
             return
         self._stop_program_list_thread()
-        self._stop_mono_device_thread()
         if self.update_thread is not None and self.update_thread.isRunning():
             self.update_thread.requestInterruption()
-        if any(
-            thread is not None and thread.isRunning()
-            for thread in (
-                self._program_list_thread,
-                self._mono_device_thread,
-                self.update_thread,
-            )
-        ):
+        if any(thread is not None and thread.isRunning() for thread in (self._program_list_thread, self.update_thread)):
             logger.debug("finalize exit waiting for background threads")
             return
         self._exit_finalized = True

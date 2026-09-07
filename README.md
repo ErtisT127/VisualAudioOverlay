@@ -45,16 +45,15 @@ radar overlay that floats over your game on your main screen.
   API; pick **All (system audio)** to capture everything as before.
 - **Game-specific presets.** Built-in frequency band-pass filters (CS2, Valorant,
   Fortnite, and more) isolate footsteps and ignore useless low-end rumble.
-- **Mono output for single-sided listeners.** Optionally play a mono down-mix of
-  the game to your headphones so you hear everything through your working ear,
-  while the overlay still shows full left/right direction. This replaces the
-  Windows "mono audio" setting (which would otherwise blind the overlay). Needs a
-  one-time virtual-cable setup; see [Mono output](#mono-output-single-sided-listeners).
+- **Single-sided listener friendly.** Turn on Windows *mono audio* and pick your
+  game under **Program**: per-app capture reads each app before Windows sums the
+  channels, so your working ear hears everything while the overlay keeps true
+  left/right direction.
 - **Smart audio boost.** Amplifies quiet, distant sounds so faint cues still register.
-- **Stereo and surround.** 7.1 / multi-channel headsets unlock 360 degree front/back
+- **Stereo and surround.** 5.1 / 7.1 headsets unlock 360 degree front/back
   detection; stereo headsets run in left/right mode automatically.
 - **Saveable presets.** Store a full per-game setup - sensitivities, filters, the
-  captured program, monitor, mono output, and radar look - and switch in one click.
+  captured program, monitor, and radar look - and switch in one click.
 - **Full customization.** Pick the radar's accent color and line thickness, with a
   live preview that matches exactly what shows up in game.
 - **Non-intrusive by design.** It does not inject into game memory or modify any game
@@ -68,7 +67,7 @@ of each sound. That direction is drawn as an arc on the radar. Because it only
 reads audio you are already playing, there is no interaction with the game itself.
 
 > **Note on detection range:** front/back separation depends on your headset. A
-> true 7.1 / 8-channel device enables full 360 degree detection. A stereo device
+> true 5.1 / 7.1 device enables full 360 degree detection. A stereo device
 > can only resolve left vs. right.
 
 ## Quick start
@@ -86,34 +85,21 @@ The dashboard can be minimized to the tray while the radar continues running.
 
 ## Mono output (single-sided listeners)
 
-If you are deaf or hard of hearing in one ear, you normally have to switch on the
-Windows "mono audio" setting to avoid missing sounds panned to your bad side. But
-that setting sums left and right together *before* the radar can read them, so the
-overlay loses all sense of direction. Mono Output solves this: the app keeps
-Windows in stereo (so the overlay still works) and produces the mono mix itself.
+Enable Windows **mono audio** (**Settings > Accessibility > Audio**) so every
+sound reaches your working ear, then capture your game under **Program**.
 
-To hear that mono mix without also hearing the game's original stereo at the same
-time, the game's audio has to be routed away from your headphones and into a
-virtual audio cable, which the app then reads. We use **VB-CABLE** for this.
+Per-app capture reads each program *before* Windows sums the channels, so you
+hear a mono mix while the radar keeps true left/right direction. **All (system
+audio)** reads the already-summed mix, so with Windows mono audio on it can only
+point straight ahead.
 
-**One-time setup:**
-
-1. In the **Mono Output** switch (Hardware panel), turn it on. If VB-CABLE isn't
-   installed, click **Install VB-CABLE**, approve the prompt, and **reboot**.
-2. In Windows **Settings > System > Sound > Volume mixer** (App volume and device
-   preferences), set your game's **Output** to **CABLE Input**.
-3. Back in the app, pick your real headphones as the Mono Output device, choose
-   your game under **Program**, and hit **Start**.
-
-> Mono Output uses **VB-CABLE**, a product of **VB-Audio Software**
-> (www.vb-cable.com). VB-CABLE is donationware - donations are welcome. See
-> [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+> Requires Windows 11 for Program capture. On Windows 10, leave Windows mono
+> audio off while the radar is running.
 
 ## Known issues
 
-**Bluetooth A2DP headsets:** "All (system audio)" may receive silence or a much
-weaker signal (Windows Bluetooth-stack behavior, not an app bug). Use **Program**
-capture instead, or a wired / virtual-cable endpoint.
+**Bluetooth A2DP headsets:** at low (but non-zero) volume, the radar loses direction.
+Raise the volume or use Program capture / a wired connection.
 
 ## Getting started (from source)
 

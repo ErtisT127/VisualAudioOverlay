@@ -38,6 +38,9 @@ VAO_API int vao_set_geometry(void *handle, int32_t x, int32_t y, int32_t width, 
 VAO_API int vao_set_drag_enabled(void *handle, int enabled);
 VAO_API int vao_set_generation(void *handle, uint64_t generation);
 VAO_API int vao_set_style(void *handle, uint32_t color_rgba, float stroke_width);
+/* Angle mapping driving the ring shape: 0 = stereo (front-hemisphere dial,
+   L/R cannot resolve front vs. back), 1 = surround (full 360-degree circle). */
+VAO_API int vao_set_mapping_mode(void *handle, int mode);
 VAO_API int vao_submit_audio(void *handle, uint64_t generation, float angle, float intensity,
                              int64_t timestamp_ns);
 VAO_API int vao_poll_event(void *handle, VaoEvent *event_out);
@@ -51,6 +54,7 @@ VAO_API int set_geometry(void *handle, int32_t x, int32_t y, int32_t width, int3
 VAO_API int set_drag_enabled(void *handle, int enabled);
 VAO_API int set_generation(void *handle, uint64_t generation);
 VAO_API int set_style(void *handle, uint32_t color_rgba, float stroke_width);
+VAO_API int set_mapping_mode(void *handle, int mode);
 VAO_API int submit_audio(void *handle, uint64_t generation, float angle, float intensity,
                          int64_t timestamp_ns);
 VAO_API int poll_event(void *handle, VaoEvent *event_out);

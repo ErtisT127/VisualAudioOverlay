@@ -79,38 +79,6 @@
               </button>
             </div>
           </div>
-
-          <!-- Mono Output (single-sided listeners). The overlay shows the
-                     direction; this also plays a mono down-mix so you HEAR
-                     everything through one ear without losing direction. The
-                     toggle lives here (compact); the multi-step setup opens in a
-                     modal so the fixed-height card never clips. -->
-          <div class="field">
-            <div class="field-label">
-              <img src="icons/headphone.svg" class="icon" alt="" />
-              <span>Mono Output</span>
-              <label class="switch" title="Play a mono mix to your headphones">
-                <input
-                  type="checkbox"
-                  id="mono-enabled"
-                  onchange="AR.setMonoEnabled(this.checked)"
-                />
-                <span class="switch-track"></span>
-              </label>
-            </div>
-            <div id="mono-hint" class="device-sub">
-              Off
-              <a
-                href="#"
-                class="mono-setup-link"
-                onclick="
-                  AR.openMonoSetup();
-                  return false;
-                "
-                >Setup</a
-              >
-            </div>
-          </div>
         </section>
 
         <!-- SETTINGS -->
@@ -497,9 +465,6 @@
       </footer>
     </div>
 
-    <!-- ── Mono Output setup modal ───────────────────────────────────────
-         Kept out of the cards so its multi-step content can scroll freely
-         without clipping the fixed-height dashboard layout. -->
     <div
       id="hotkey-modal"
       class="modal is-hidden"
@@ -659,77 +624,6 @@
             Delete
           </button>
         </div>
-      </div>
-    </div>
-
-    <div
-      id="mono-modal"
-      class="modal is-hidden"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mono-modal-title"
-    >
-      <div class="modal-backdrop" onclick="AR.closeMonoSetup()"></div>
-      <div class="modal-card">
-        <h2 id="mono-modal-title" class="modal-title">Mono Output Setup</h2>
-        <p class="modal-intro">
-          Hear the whole game through your working ear while the radar still shows direction.
-          AudioRadar does the mono mix for you, so you turn
-          <b>off</b> the Windows "mono audio" setting (leaving it on hides the direction the overlay
-          needs). Follow the 5 steps below once.
-        </p>
-
-        <div class="field">
-          <div class="field-label"><span>Mono plays to</span></div>
-          <div class="live-field">
-            <button
-              type="button"
-              id="mono-output-select"
-              class="select live-select"
-              aria-haspopup="listbox"
-              aria-expanded="false"
-            >
-              <span id="mono-output-select-label" class="live-label"></span>
-            </button>
-            <div
-              id="mono-output-select-menu"
-              class="live-menu"
-              role="listbox"
-              aria-labelledby="mono-output-select"
-            ></div>
-          </div>
-          <div class="device-sub" style="margin-top: 6px">
-            Pick your real headphones here, not the virtual cable.
-          </div>
-        </div>
-
-        <div id="mono-status" class="device-sub mono-status"></div>
-        <button
-          id="mono-install-btn"
-          class="btn-toggle btn-toggle--small is-hidden"
-          onclick="AR.installCable()"
-        >
-          Install VB-CABLE
-        </button>
-
-        <ol class="mono-steps">
-          <li>Install VB-CABLE (button above if shown), then <b>reboot</b> if Windows asks.</li>
-          <li>
-            Turn <b>off</b> Windows mono audio:
-            <b>Settings &rsaquo; Accessibility &rsaquo; Audio</b>. AudioRadar handles mono now.
-          </li>
-          <li>
-            Send your game's sound into the cable:
-            <b>Settings &rsaquo; System &rsaquo; Sound &rsaquo; Volume mixer</b>, find your game,
-            set its output to <b>CABLE Input</b>.
-          </li>
-          <li>Above, set <b>"Mono plays to"</b> to your real headphones.</li>
-          <li>Pick your game under <b>Program</b>, then press <b>Start</b>.</li>
-        </ol>
-
-        <button class="btn-toggle btn-toggle--small mono-done" onclick="AR.closeMonoSetup()">
-          Done
-        </button>
       </div>
     </div>
 

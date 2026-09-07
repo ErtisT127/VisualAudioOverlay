@@ -6,8 +6,8 @@
 // fires because the stub swallows DOMContentLoaded.
 //
 // Covers the things that broke in this area:
-//  - Every select (monitor / program / preset / mono output) is a live DOM
-//    menu - not a native <select>. QtWebEngine draws native popups as
+//  - Every select (monitor / program / preset) is a live DOM menu - not a
+//    native <select>. QtWebEngine draws native popups as
 //    unstyled Qt widgets and cannot rebuild them while open, which is why a
 //    list only appeared after the user had already picked an entry.
 //  - Lists refresh WHILE open: a change arriving mid-open re-renders the
@@ -180,7 +180,7 @@ const htmlNoComments = html.replace(/<!--[\s\S]*?-->/g, "");
 check("no native <select> remains", !/<select/.test(htmlNoComments));
 // Attributes sit one per line, so search with a bounded cross-line gap.
 const close = '[\\s\\S]{0,120}?class="';
-for (const id of ["monitor-select", "program-select", "preset-select", "mono-output-select"]) {
+for (const id of ["monitor-select", "program-select", "preset-select"]) {
   check(
     id + " is a live trigger",
     new RegExp('id="' + id + '"' + close + 'select live-select"').test(htmlNoComments),
@@ -195,10 +195,6 @@ for (const id of ["monitor-select", "program-select", "preset-select", "mono-out
   );
 }
 check("program menu opens downward (no --up variant)", !/live-menu--up/.test(html));
-check(
-  "mono field is inside the modal",
-  html.indexOf('id="mono-output-select"') > html.indexOf('id="mono-modal"'),
-);
 const css = fs.readFileSync(path.join(__dirname, "..", "dashboard_v2", "style.css"), "utf8");
 check("no orphaned .select-wrap rules", !/select-wrap/.test(css));
 check("no orphaned --up direction rules", !/live-menu--up/.test(css));
@@ -554,85 +550,6 @@ check("frozen dashboard does not refresh either list", calls.length === 0, JSON.
 W.AR.toggleLiveSelect("program-select");
 check("frozen dashboard cannot reopen", !W.liveIsOpen("program-select"));
 W.setDashboardFrozen(false);
-
-// ── 10. Mono live menu keeps "" as a real value ────────────────────────
-section("mono output live menu");
-W.onMonoStateChanged(
-  JSON.stringify({
-    devices: ["Headphones", "CABLE Input"],
-    default: "Headphones",
-    cable: "CABLE Input",
-    enabled: false,
-    selected: "",
-  }),
-);
-check(
-  "System default selectable via empty value",
-  W.liveSelected("mono-output-select") === "",
-  String(W.liveSelected("mono-output-select")),
-);
-check(
-  "System default label names the default device",
-  labelEl("mono-output-select").textContent === "System default (Headphones)",
-  labelEl("mono-output-select").textContent,
-);
-W.onMonoStateChanged(
-  JSON.stringify({
-    devices: ["Headphones", "CABLE Input"],
-    default: "Headphones",
-    cable: "CABLE Input",
-    enabled: true,
-    selected: "CABLE Input",
-  }),
-);
-check("named device selected", W.liveSelected("mono-output-select") === "CABLE Input");
-check(
-  "named device label follows",
-  labelEl("mono-output-select").textContent === "CABLE Input",
-  labelEl("mono-output-select").textContent,
-);
-
-calls.splice(0);
-W.AR.toggleLiveSelect("mono-output-select");
-check(
-  "opening mono output asks for no backend enumeration",
-  calls.length === 0,
-  JSON.stringify(calls),
-);
-check(
-  "mono rows built with System default first",
-  menuEl("mono-output-select").children.length === 3,
-  String(menuEl("mono-output-select").children.length),
-);
-calls.splice(0);
-W.AR.pickLiveOption("mono-output-select", "");
-check("picking System default closes the menu", !W.liveIsOpen("mono-output-select"));
-check(
-  "picking System default keeps the empty value",
-  W.liveSelected("mono-output-select") === "",
-  String(W.liveSelected("mono-output-select")),
-);
-check(
-  "picking System default tells the backend",
-  hasCall("set_mono_output", ""),
-  JSON.stringify(calls),
-);
-
-// The chosen device disappears (unplugged) -> falls back to the first entry.
-W.onMonoStateChanged(
-  JSON.stringify({
-    devices: ["Headphones"],
-    default: "Headphones",
-    cable: "CABLE Input",
-    enabled: true,
-    selected: "",
-  }),
-);
-check(
-  "unplugged device falls back to System default",
-  W.liveSelected("mono-output-select") === "",
-  String(W.liveSelected("mono-output-select")),
-);
 
 // ── 11. Dashboard text selection and context menu are disabled ─────────
 section("text selection and context menu");

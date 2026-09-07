@@ -83,9 +83,6 @@ switch ($CCompiler) {
     "clang" { $nuitkaArguments += "--clang" }
     "zig" { $nuitkaArguments += "--zig" }
 }
-if (Test-Path -LiteralPath (Join-Path $projectRoot "vendor") -PathType Container) {
-    $nuitkaArguments += "--include-data-dir=vendor=vendor"
-}
 $nuitkaArguments += "src/main.py"
 
 & $interp -m nuitka @nuitkaArguments

@@ -403,8 +403,8 @@ class ProcessLoopbackCapture:
 
     def _resolve_mix_spec(self, client: IAudioClient):
         """Read the wire's real channel layout from the endpoint's shared-mode
-        mix format, so a multichannel wire (e.g. 7.1 routed to VB-CABLE) is
-        captured with all of its channels instead of a hard-coded stereo pair.
+        mix format, so a multichannel wire (e.g. 7.1 over HDMI) is captured with
+        all of its channels instead of a hard-coded stereo pair.
         Returns a {"channels", "mask", "subformat"} spec, or None when nothing
         can be resolved - the caller then falls back to stereo. A failed probe
         must never break capture.
@@ -688,9 +688,9 @@ def _sessions_all_render_devices():
     """Yield AudioSession objects across *every* active render endpoint.
 
     pycaw's AudioUtilities.GetAllSessions() only looks at the default playback
-    device, so an app routed elsewhere (e.g. a game sent to VB-CABLE for the mono
-    path) never shows up. We enumerate all ACTIVE render endpoints and pull the
-    sessions from each so the app appears regardless of which output it plays to.
+    device, so an app routed to another output (e.g. a second sound card) never
+    shows up. We enumerate all ACTIVE render endpoints and pull the sessions
+    from each so the app appears regardless of which output it plays to.
     """
     import comtypes
     from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
@@ -732,8 +732,8 @@ def list_audio_programs() -> list[dict]:
     [{"name": "Chrome", "pid": 1234}, ...] sorted by name.
 
     Scans every active render endpoint (not just the default device) so a program
-    routed to a non-default output - e.g. a game sent to VB-CABLE for the mono
-    path - still appears. Note: a program only shows up once it has opened an
+    routed to a non-default output - e.g. a second sound card or a capture
+    device - still appears. Note: a program only shows up once it has opened an
     audio stream. The PID is a hint; resolve it freshly at capture time since
     PIDs can change.
     """

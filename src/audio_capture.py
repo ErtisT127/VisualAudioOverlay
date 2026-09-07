@@ -37,8 +37,6 @@ class AudioCaptureThread(QThread):
         max_amplitude=1.0,
         target_pid=None,
         target_name=None,
-        mono_enabled=False,
-        mono_device=None,
         _manager=True,
         shared_params=None,
         metrics_enabled=None,
@@ -56,12 +54,6 @@ class AudioCaptureThread(QThread):
         # via WASAPI process loopback. None = whole-system loopback (soundcard).
         self.target_pid = target_pid
         self.target_name = target_name
-        # Mono output: when enabled, the raw (unfiltered) captured audio is also
-        # summed to mono and played to `mono_device` for single-sided listeners.
-        # Read at thread start (like target); toggle via the app before Start.
-        self.mono_enabled = bool(mono_enabled)
-        self.mono_device = mono_device or None
-        self._mono = None
         self._process = None
         self._recv_conn = None
         self._audio_mailbox_lock = threading.Lock()
@@ -79,9 +71,11 @@ class AudioCaptureThread(QThread):
         # Slots 0-4 are the live audio parameters; slot 5 is the mapping
         # choice for >=6-channel wires (1.0 = surround, 0.0 = stereo). Every
         # capture start builds a fresh thread and therefore a fresh array, so
-        # slot 5 comes up as surround - the session default - and an in-run
-        # toggle dies with the thread: a per-session choice, never a
-        # remembered one.
+        # slot 5 comes up as surround - the wire-independent fallback that
+        # covers the brief window before the app re-applies its remembered
+        # mapping priority on this wire's device_info. In-run toggles write
+        # the slot directly; nothing in here persists across captures (the
+        # remembered choice lives in settings.json, app-side).
         self._shared_params = shared_params or mp.get_context("spawn").Array(
             "d", [sensitivity, gain, freq_low, freq_high, max_amplitude, 1.0]
         )
@@ -127,13 +121,6 @@ class AudioCaptureThread(QThread):
         self.target_pid = pid
         self.target_name = name
 
-    def set_mono(self, enabled, device=None):
-        """Enable/disable the mono down-mix output and pick its playback device.
-        Only takes effect before the thread starts (the thread is recreated on
-        each Start, so the app re-applies this in start_radar)."""
-        self.mono_enabled = bool(enabled)
-        self.mono_device = device or None
-
     def set_sensitivity(self, sensitivity):
         self.sensitivity = sensitivity
         self._shared_params[0] = sensitivity
@@ -176,14 +163,12 @@ class AudioCaptureThread(QThread):
             return
         # Per-app capture takes the process-loopback path; otherwise capture the
         # whole system mix the way we always have.
-        self._start_mono()
         try:
             if self.target_pid:
                 self._run_process_loopback()
             else:
                 self._run_system_loopback()
         finally:
-            self._stop_mono()
             logger.debug("capture thread run returned (worker)")
 
     def _run_manager(self):
@@ -196,8 +181,6 @@ class AudioCaptureThread(QThread):
             "max_amplitude": self.max_amplitude,
             "target_pid": self.target_pid,
             "target_name": self.target_name,
-            "mono_enabled": self.mono_enabled,
-            "mono_device": self.mono_device,
             "shared_params": self._shared_params,
         }
         ctx = mp.get_context("spawn")
@@ -285,36 +268,6 @@ class AudioCaptureThread(QThread):
             self.ready_signal.emit()
         return kind
 
-    # ── Mono down-mix output ───────────────────────────────────────────
-    def _start_mono(self):
-        if not self.mono_enabled:
-            return
-        try:
-            from mono_output import MonoMixThread
-
-            self._mono = MonoMixThread(device_name=self.mono_device, samplerate=self.samplerate)
-            self._mono.failed.connect(lambda msg: logger.error("Mono output error: %s", msg))
-            self._mono.start()
-            logger.info("Mono output started device=%s", self.mono_device or "default device")
-        except Exception as e:  # noqa: BLE001 - optional mono output must degrade gracefully.
-            logger.warning("Mono output unavailable; continuing without it: %s", e)
-            self._mono = None
-
-    def _feed_mono(self, data):
-        """Send the RAW (pre-bandpass) chunk to the mono player so the user hears
-        the full game audio, not just the filtered footstep band."""
-        if self._mono is not None:
-            self._mono.feed(data)
-
-    def _stop_mono(self):
-        if self._mono is not None:
-            try:
-                if not self._mono.stop():
-                    return
-            except Exception:
-                logger.exception("Mono output stop failed")
-            self._mono = None
-
     def _run_process_loopback(self):
         """Capture only the selected program; never fall back to system audio."""
         try:
@@ -344,11 +297,9 @@ class AudioCaptureThread(QThread):
         try:
             first_data = cap.read(AUDIO_BLOCK_FRAMES)
             self.ready_signal.emit()
-            self._feed_mono(first_data)
             self._process_chunk(first_data, channels)
             while self.running:
                 data = cap.read(AUDIO_BLOCK_FRAMES)
-                self._feed_mono(data)
                 self._process_chunk(data, channels)
                 reads += 1
                 # The stream gives no error of its own when the target exits;
@@ -419,9 +370,10 @@ class AudioCaptureThread(QThread):
                 # The stream's channel count is the endpoint's shared-mode mix
                 # format, fixed at open - report it as-is. No content probe:
                 # channels are a device property, and a silent multichannel
-                # device is still a multichannel device. The mapping listed is
-                # the session default for that wire (surround on >=6ch); the
-                # user can switch to stereo live, which the GUI logs.
+                # device is still a multichannel device. The mapping the GUI
+                # derives for this wire (its remembered priority on >=6ch,
+                # stereo below) is pushed back right after this message; the
+                # user can keep switching it live, which the GUI logs.
                 wire_channels = int(first_data.shape[1])
                 mapping = "surround" if wire_channels >= 6 else ("stereo" if wire_channels >= 2 else "mono")
                 logger.info("Wire channels: %s | mapping: %s", wire_channels, mapping)
@@ -431,7 +383,6 @@ class AudioCaptureThread(QThread):
 
                 data = first_data
                 while self.running:
-                    self._feed_mono(data)
                     self._process_chunk(data, wire_channels)
                     if self.running:
                         data = mic.record(numframes=AUDIO_BLOCK_FRAMES)

@@ -272,73 +272,11 @@ body::before {
   color: var(--text);
 }
 
-/* ── Mono output toggle + setup ────────────────────────────────── */
-.switch {
-  margin-left: auto;
-  position: relative;
-  display: inline-block;
-  width: 40px;
-  height: 22px;
-  cursor: pointer;
-  flex: none;
-}
-.switch input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-.switch-track {
-  position: absolute;
-  inset: 0;
-  background: var(--track);
-  border-radius: 22px;
-  transition: background 0.15s ease;
-}
-.switch-track::before {
-  content: "";
-  position: absolute;
-  left: 3px;
-  top: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #fff;
-  transition: transform 0.15s ease;
-}
-.switch input:checked + .switch-track {
-  background: var(--accent);
-}
-.switch input:checked + .switch-track::before {
-  transform: translateX(18px);
-}
-
-/* The Mono Output toggle lives in the (narrow, fixed-height) HARDWARE card, but
-   its multi-step setup lives in a modal so the card never clips. */
-.mono-setup-link {
-  color: var(--accent);
-  text-decoration: none;
-  margin-left: 8px;
-}
-.mono-setup-link:hover {
-  text-decoration: underline;
-}
-
-.mono-status {
-  line-height: 1.35;
-  font-size: 13px;
-  margin: 4px 0 8px;
-}
-.mono-status .ok {
-  color: #1fcb4f;
-}
-.mono-status .warn {
-  color: #f0a500;
-}
 .is-hidden {
   display: none !important;
 }
 
-/* ── Modal (mono setup) ────────────────────────────────────────── */
+/* ── Modal dialogs (hotkey / color / presets) ──────────────────── */
 .modal {
   position: fixed;
   inset: 0;
@@ -449,22 +387,6 @@ body::before {
 .preset-modal-card {
   width: 360px;
 }
-.mono-steps {
-  margin: 14px 0 18px 18px;
-  font-size: 13px;
-  color: var(--text-dim);
-  line-height: 1.5;
-}
-.mono-steps li {
-  margin-bottom: 6px;
-}
-.mono-steps b {
-  color: var(--text);
-  font-weight: 500;
-}
-.mono-done {
-  margin-top: 4px;
-}
 .hotkey-modal-card {
   width: 360px;
 }
@@ -564,7 +486,7 @@ body::before {
 
 /* Live dropdowns: DOM menus standing in for native <select>s, whose Qt popup
    cannot be themed or rebuilt while open in QtWebEngine. Every select on the
-   panel (monitor / program / preset / mono) uses this control, so the pill
+   panel (monitor / program / preset) uses this control, so the pill
    trigger mirrors .select above and the menu reuses the same dark tokens.
    Menus grow downward like a native popup and size to their longest row
    (min-width keeps them at least as wide as the trigger). */
